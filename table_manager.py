@@ -7,18 +7,14 @@ class TableManager:
     def __init__(self, config):
         self.base_path = config.get('downloads_path', 'downloaded_videos')
         self.table_file = os.path.join(self.base_path, config.get('table_file', 'prompts_table.csv'))
-        self.headers = ['id', 'prompt', 'status', 'model', 'video_path', 'timestamp', 'slot', 'attempt_count', 'last_status_message']
+        self.headers = ['id', 'prompt', 'status', 'model', 'video_path', 'timestamp', 'slot']
         
         # Статусы промптов
         self.STATUS_PENDING = 'pending'          # Ожидает обработки
         self.STATUS_QUEUED = 'queued'           # В очереди на обработку
-        self.STATUS_PROMPT_SENT = 'prompt_sent'  # Промпт отправлен
-        self.STATUS_GENERATION_STARTED = 'generation_started'  # Генерация началась
-        self.STATUS_WAITING_VIDEO = 'waiting_video'  # Ожидание видео
         self.STATUS_IN_PROGRESS = 'in_progress'  # В процессе обработки
         self.STATUS_COMPLETED = 'completed'      # Успешно завершен
         self.STATUS_ERROR = 'error'             # Ошибка при обработке
-        self.STATUS_LIMIT_REACHED = 'limit_reached'  # Достигнут лимит запросов
         self.STATUS_SKIPPED = 'skipped'         # Пропущен пользователем
         self.STATUS_TIMEOUT = 'timeout'         # Превышено время ожидания
         
@@ -70,7 +66,7 @@ class TableManager:
             writer.writeheader()
             writer.writerows(rows)
 
-    def update_status(self, prompt_id, status, model='', video_path='', slot='', status_message=''):
+    def update_status(self, prompt_id, status, model='', video_path='', slot=''):
         """Обновляет статус и другие поля промпта"""
         rows = self._read_table()
         for row in rows:
@@ -83,20 +79,6 @@ class TableManager:
                 if slot:
                     row['slot'] = str(slot)
                 row['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                # Обновляем счетчик попыток для некоторых статусов
-                if status in [self.STATUS_PROMPT_SENT]:
-                    try:
-                        attempt_count = int(row.get('attempt_count', '0')) + 1
-                    except ValueError:
-                        # Если attempt_count не является числом или пустая строка
-                        attempt_count = 1
-                    row['attempt_count'] = str(attempt_count)
-                
-                # Записываем последнее статусное сообщение
-                if status_message:
-                    row['last_status_message'] = status_message
-                
         self._write_table(rows)
 
     def mark_queued(self, prompt_id, slot_number):
@@ -151,18 +133,6 @@ class TableManager:
         """Возвращает промпт в состояние ожидания"""
         self.update_status(prompt_id, self.STATUS_PENDING, slot='')
 
-    def mark_prompt_sent(self, prompt_id, model=''):
-        """Отмечает, что промпт был отправлен боту"""
-        self.update_status(prompt_id, self.STATUS_PROMPT_SENT, model=model)
-    
-    def mark_generation_started(self, prompt_id, model='', status_message=''):
-        """Отмечает, что бот начал генерацию видео"""
-        self.update_status(prompt_id, self.STATUS_GENERATION_STARTED, model=model, status_message=status_message)
-    
-    def mark_waiting_video(self, prompt_id, model=''):
-        """Отмечает, что система ожидает получения видео"""
-        self.update_status(prompt_id, self.STATUS_WAITING_VIDEO, model=model)
-    
-    def mark_limit_reached(self, prompt_id, status_message=''):
-        """Отмечает, что достигнут лимит запросов"""
-        self.update_status(prompt_id, self.STATUS_LIMIT_REACHED, status_message=status_message) 
+    def get_all_prompts(self):
+        """Получает список всех промптов из таблицы"""
+        return self._read_table() 

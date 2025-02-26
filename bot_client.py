@@ -4,20 +4,6 @@ import json
 import re
 from datetime import datetime
 import hashlib
-from init_config import ConfigInitializer
-
-# Загружаем конфигурацию
-config = ConfigInitializer.load_config()
-if not config:
-    print("Ошибка загрузки конфигурации")
-    exit(1)
-
-# Инициализируем клиента
-session_name = f"bot_session_{config['api_id']}"
-client = TelegramClient(session_name, int(config['api_id']), config['api_hash'])
-
-# Целевой бот для взаимодействия
-TARGET_BOT = config.get('bot_name', '@syntxaibot')
 
 class PromptTracker:
     def __init__(self):
