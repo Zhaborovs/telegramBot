@@ -19,44 +19,21 @@ async def process_prompt(prompt_data, slot, navigator, request_manager, table_ma
     """Обрабатывает один промпт"""
     try:
         while True:  # Добавляем цикл для повторных попыток
-            # Получаем информацию о модели
-            config = ConfigInitializer.load_config()
-            model_number = config.get('model_number', '1')
-            model = navigator.models.get(model_number, navigator.models['1'])
-            
-            # Проверяем, находится ли модель в состоянии лимита
-            if navigator.message_monitor.is_model_limited(model):
-                print(f"\nМодель {model} достигла лимита запросов (текущее значение: {navigator.message_monitor.model_limits.get(model, 0)})")
-                print(f"Слот {slot} - Выберите действие:")
-                print("1. Ждать снятия лимита (до получения видео)")
-                print("2. Освободить слот и продолжить")
-                print("3. Выйти")
-                
-                choice = input(f"Слот {slot} - Введите номер действия (1-3): ").strip()
-                
-                if choice == '1':
-                    # Ждем снятия лимита
-                    if await navigator.wait_for_limit_release(model):
-                        print(f"Лимит для модели {model} уменьшен, повторяем отправку промпта")
-                        continue  # Повторяем попытку
-                    else:
-                        print("Не дождались снятия лимита")
-                        table_manager.mark_skipped(prompt_data['id'])
-                        await request_manager.release_slot(slot)
-                        return False
-                elif choice == '2':
-                    table_manager.mark_skipped(prompt_data['id'])
-                    await request_manager.release_slot(slot)
-                    return False
-                elif choice == '3':
-                    await request_manager.release_slot(slot)
-                    return None
-                continue  # На всякий случай продолжаем цикл
-
+            # Модель будет выбрана внутри navigate_and_send_prompt
             # Отправляем промпт
             success = await navigator.navigate_and_send_prompt(prompt_data, slot)
             
             if not success:
+                # Проверяем, не был ли промпт отмечен как pending из-за лимита
+                prompt_status = table_manager.get_status(prompt_data['id'])
+                if prompt_status['status'] == 'pending':
+                    print(f"\nПромпт {prompt_data['id']} не был отправлен из-за лимита в слоте {slot}")
+                    print(f"Автоматическое ожидание снятия лимита для данной модели...")
+                    # Освобождаем слот и отмечаем промпт как ожидающий
+                    await request_manager.release_slot(slot)
+                    return False  # Вернет промпт обратно в очередь
+                
+                # Для других ошибок (не связанных с лимитом) показываем меню
                 print(f"\nНе удалось отправить промпт {prompt_data['id']} в слоте {slot}")
                 print(f"Слот {slot} - Выберите действие:")
                 print("1. Повторить попытку")

@@ -5,6 +5,7 @@ import os
 from message_filter import MessageFilter
 from message_logger import MessageLogger
 from prompt_matcher import PromptMatcher
+import re
 
 class MessageMonitor:
     def __init__(self, client, bot, video_downloader, config):
@@ -74,6 +75,19 @@ class MessageMonitor:
         if model in self.model_limits and self.model_limits[model] > 0:
             self.model_limits[model] -= 1
             print(f"Уменьшен счетчик модели {model}: {self.model_limits[model]}/{self.max_model_limit}")
+            
+            # Если счетчик был на максимуме и теперь уменьшился, сигнализируем об освобождении слота
+            if self.model_limits[model] == self.max_model_limit - 1:
+                print(f"Лимит для модели {model} снят (счетчик уменьшен с {self.max_model_limit} до {self.model_limits[model]})")
+                # Если кто-то ждет освобождения слота
+                if self.waiting_for_slot:
+                    print("Сигнализируем об освобождении слота для модели")
+                    self.slot_freed.set()
+                    
+                # Если ожидаем любое видео для снятия лимита
+                if self.waiting_for_any_video:
+                    print("Сигнализируем о снятии лимита для модели")
+                    self.any_video_received.set()
 
     def set_model_limit(self, model):
         """Устанавливает максимальный лимит для модели"""
@@ -118,6 +132,7 @@ class MessageMonitor:
             # Если получен лимит для этой модели, считаем промпт не отправленным
             if request.get('limit_detected', False):
                 print(f"Лимит запросов для модели {model}, промпт не отправлен")
+                # Отмечаем промпт как ожидающий для повторной отправки
                 self.table_manager.mark_pending(request['prompt_id'])
                 # Уменьшаем счетчик модели при неудаче
                 self.decrease_model_counter(model)
@@ -181,27 +196,58 @@ class MessageMonitor:
                 # Определяем модель из текста сообщения или предыдущего контекста
                 model_name = None
                 
-                # Поиск названий моделей в тексте сообщения
-                message_lower = message_text.lower()
-                models_map = {
-                    'sora': '🌙 SORA',
-                    'hailuo': '➕ Hailuo MiniMax',
-                    'minimax': '➕ Hailuo MiniMax',
-                    'runway': '📦 RunWay: Gen-3',
-                    'gen-3': '📦 RunWay: Gen-3',
-                    'kling': '🎬 Kling 1.6',
-                    'pika': '🎯 Pika 2.0',
-                    'act-one': '👁 Act-One (Аватары 2.0)',
-                    'аватары': '👁 Act-One (Аватары 2.0)',
-                    'luma': '🌫 Luma: DM',
-                    'стилизатор': '🦋 RW: Стилизатор'
-                }
+                # Ищем модель в формате "🧮 Модель: #Sora" или "Модель: #Sora"
+                model_patterns = [
+                    r'(?:\*\*)?🧮\s+Модель:(?:\*\*)?\s+`?#?([^`\n]+)`?',
+                    r'Модель:\s+`?#?([^`\n]+)`?'
+                ]
                 
-                # Ищем упоминания моделей в тексте сообщения
-                for key, model in models_map.items():
-                    if key in message_lower:
-                        model_name = model
+                for pattern in model_patterns:
+                    model_match = re.search(pattern, message_text, re.IGNORECASE)
+                    if model_match:
+                        model_text = model_match.group(1).strip()
+                        if model_text.lower() == 'sora':
+                            model_name = '🌙 SORA'
+                        elif any(m in model_text.lower() for m in ['hailuo', 'minimax']):
+                            model_name = '➕ Hailuo MiniMax'
+                        elif any(m in model_text.lower() for m in ['runway', 'gen-3']):
+                            model_name = '📦 RunWay: Gen-3'
+                        elif 'kling' in model_text.lower():
+                            model_name = '🎬 Kling 1.6'
+                        elif 'pika' in model_text.lower():
+                            model_name = '🎯 Pika 2.0'
+                        elif any(m in model_text.lower() for m in ['act-one', 'аватары']):
+                            model_name = '👁 Act-One (Аватары 2.0)'
+                        elif 'luma' in model_text.lower():
+                            model_name = '🌫 Luma: DM'
+                        elif 'стилизатор' in model_text.lower():
+                            model_name = '🦋 RW: Стилизатор'
+                        print(f"Извлечена модель из сообщения: {model_name}")
                         break
+                
+                # Если модель не найдена в формате "Модель:", ищем её по ключевым словам
+                if not model_name:
+                    # Поиск названий моделей в тексте сообщения
+                    message_lower = message_text.lower()
+                    models_map = {
+                        'sora': '🌙 SORA',
+                        'hailuo': '➕ Hailuo MiniMax',
+                        'minimax': '➕ Hailuo MiniMax',
+                        'runway': '📦 RunWay: Gen-3',
+                        'gen-3': '📦 RunWay: Gen-3',
+                        'kling': '🎬 Kling 1.6',
+                        'pika': '🎯 Pika 2.0',
+                        'act-one': '👁 Act-One (Аватары 2.0)',
+                        'аватары': '👁 Act-One (Аватары 2.0)',
+                        'luma': '🌫 Luma: DM',
+                        'стилизатор': '🦋 RW: Стилизатор'
+                    }
+                    
+                    # Ищем упоминания моделей в тексте сообщения
+                    for key, model in models_map.items():
+                        if key in message_lower:
+                            model_name = model
+                            break
                         
                 # Если модель не найдена в тексте, берем из активных запросов
                 if not model_name and self.active_requests:

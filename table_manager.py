@@ -13,6 +13,7 @@ class TableManager:
         self.STATUS_PENDING = 'pending'          # Ожидает обработки
         self.STATUS_QUEUED = 'queued'           # В очереди на обработку
         self.STATUS_IN_PROGRESS = 'in_progress'  # В процессе обработки
+        self.STATUS_WAITING_DOWNLOAD = 'waiting_download'  # Ожидает загрузки видео
         self.STATUS_COMPLETED = 'completed'      # Успешно завершен
         self.STATUS_ERROR = 'error'             # Ошибка при обработке
         self.STATUS_SKIPPED = 'skipped'         # Пропущен пользователем
@@ -96,11 +97,15 @@ class TableManager:
     def get_active_prompts(self):
         """Получает список активных промптов (в очереди или в обработке)"""
         return [row for row in self._read_table() 
-               if row['status'] in [self.STATUS_QUEUED, self.STATUS_IN_PROGRESS]]
+               if row['status'] in [self.STATUS_QUEUED, self.STATUS_IN_PROGRESS, self.STATUS_WAITING_DOWNLOAD]]
 
     def mark_in_progress(self, prompt_id, model=''):
         """Отмечает промпт как находящийся в обработке"""
         self.update_status(prompt_id, self.STATUS_IN_PROGRESS, model=model)
+
+    def mark_waiting_download(self, prompt_id, model=''):
+        """Отмечает промпт как ожидающий загрузки видео"""
+        self.update_status(prompt_id, self.STATUS_WAITING_DOWNLOAD, model=model)
 
     def mark_error(self, prompt_id, model=''):
         """Отмечает ошибку при обработке промпта"""
@@ -124,6 +129,10 @@ class TableManager:
     def get_in_progress_prompts(self):
         """Получает список промптов в обработке"""
         return [row for row in self._read_table() if row['status'] == self.STATUS_IN_PROGRESS]
+
+    def get_waiting_download_prompts(self):
+        """Получает список промптов, ожидающих загрузки видео"""
+        return [row for row in self._read_table() if row['status'] == self.STATUS_WAITING_DOWNLOAD]
 
     def get_pending_prompts(self):
         """Получает список необработанных промптов"""

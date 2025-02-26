@@ -31,8 +31,7 @@ log_file=bot.log
 # 4 = 🎬 Kling 1.6
 # 5 = 🎯 Pika 2.0
 # 6 = 👁 Act-One (Аватары 2.0)
-# 7 = 🌫 Luma: DM
-# 8 = 🦋 RW: Стилизатор'''
+# 7 = 🌫 Luma: DM'''
 
         return config_template
 
