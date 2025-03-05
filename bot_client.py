@@ -2,8 +2,23 @@ from telethon import TelegramClient, events
 import asyncio
 import json
 import re
+import os
 from datetime import datetime
 import hashlib
+
+# Инициализация конфигурации
+with open('config.json', 'r') as f:
+    config = json.load(f)
+
+# Создание директории для загрузок
+os.makedirs('downloads', exist_ok=True)
+
+# Инициализация клиента
+client = TelegramClient('session_name', config['api_id'], config['api_hash'])
+TARGET_BOT = config['bot_username']  # Имя целевого бота
+
+# Инициализация переменных состояния
+request_success = False
 
 class PromptTracker:
     def __init__(self):
@@ -42,15 +57,22 @@ prompt_tracker = PromptTracker()
 @client.on(events.NewMessage(from_users=TARGET_BOT))
 async def handle_bot_messages(event):
     global request_success
-    message_text = event.message.text
+    message_text = event.message.text or ""
     
     # Проверяем, содержит ли сообщение информацию о промпте
     if "📍 Ваш запрос:" in message_text:
-        prompt = re.search(r'📍 Ваш запрос:\s*(.+)', message_text).group(1)
-        prompt_tracker.set_current_video_prompt(prompt, event.message.id)
+        try:
+            prompt_match = re.search(r'📍 Ваш запрос:\s*(.+)', message_text)
+            if prompt_match:
+                prompt = prompt_match.group(1)
+                prompt_tracker.set_current_video_prompt(prompt, event.message.id)
+        except Exception as e:
+            print(f"❌ Ошибка при извлечении промпта: {e}")
     
-    # Если сообщение содержит видео
-    if event.message.video:
+    # Если сообщение содержит видео (исправленная проверка)
+    if (event.message.media and hasattr(event.message.media, 'document') and 
+        event.message.media.document.mime_type.startswith('video/')):
+        
         prompt = prompt_tracker.get_prompt_for_video(event.message.id)
         if prompt:
             # Создаем безопасное имя файла из промпта
@@ -61,6 +83,7 @@ async def handle_bot_messages(event):
                 await client.download_media(event.message, file=f"downloads/{filename}")
                 print(f"✅ Видео сохранено как: {filename}")
                 prompt_tracker.clear_download(event.message.id)
+                request_success = True
             except Exception as e:
                 print(f"❌ Ошибка при сохранении видео: {e}")
 
@@ -89,7 +112,7 @@ async def main():
         if command == '/video':
             await client.send_message(TARGET_BOT, '/video')
             await asyncio.sleep(2)
-            await client.send_message(TARGET_BOT, 'sora')
+            await client.send_message(TARGET_BOT, 'sora') # type: ignore
             await asyncio.sleep(2)
             
             prompt = input("Введите промпт: ")
