@@ -1,11 +1,12 @@
 import asyncio
 
 class TelegramNavigator:
-    def __init__(self, client, bot, config, message_monitor):
+    def __init__(self, client, bot, config, message_monitor, logger=None):
         self.client = client
         self.bot = bot
         self.config = config
         self.message_monitor = message_monitor
+        self.logger = logger
         self.models = {
             '1': '🌙 SORA',
             '2': '➕ Hailuo MiniMax',
@@ -24,10 +25,20 @@ class TelegramNavigator:
         """
         if model_number in self.models:
             self.config['model_number'] = model_number
-            print(f"Установлена модель: {self.models[model_number]}")
+            message = f"Установлена модель: {self.models[model_number]}"
+            print(message)
+            
+            if self.logger:
+                self.logger.log_app_event("MODEL_CHANGE", message, 
+                                        extra_info={"model_number": model_number, "model_name": self.models[model_number]})
             return True
         else:
-            print(f"Ошибка: неверный номер модели {model_number}. Допустимые значения: от 1 до 8.")
+            message = f"Ошибка: неверный номер модели {model_number}. Допустимые значения: от 1 до 8."
+            print(message)
+            
+            if self.logger:
+                self.logger.log_app_event("MODEL_ERROR", message, "ERROR", 
+                                        {"attempted_model": model_number})
             return False
 
     async def navigate_and_send_prompt(self, prompt_data, slot=None):
@@ -41,18 +52,37 @@ class TelegramNavigator:
             model_number = self.config.get('model_number', '1')
             model = self.models.get(model_number, self.models['1'])
             
+            if self.logger:
+                self.logger.log_app_event("NAVIGATION_START", 
+                                        f"Начинаем навигацию для отправки промпта {prompt_data['id']} в слоте {slot}",
+                                        extra_info={"model": model})
+            
             # Проверяем, находится ли модель в состоянии лимита
             if self.message_monitor.is_model_limited(model):
-                print(f"\nМодель {model} достигла лимита запросов (текущее значение: {self.message_monitor.model_limits.get(model, 0)})")
+                message = f"\nМодель {model} достигла лимита запросов (текущее значение: {self.message_monitor.model_limits.get(model, 0)})"
+                print(message)
                 print(f"Автоматическое ожидание снятия лимита для модели {model}...")
+                
+                if self.logger:
+                    self.logger.log_model_limit(model, self.message_monitor.model_limits.get(model, 0), prompt_data['id'])
                 
                 # Ждем снятия лимита
                 await self.wait_for_limit_release(model)
                 print(f"Лимит для модели {model} снят, продолжаем отправку промпта")
                 
+                if self.logger:
+                    self.logger.log_app_event("LIMIT_RELEASED", 
+                                            f"Лимит для модели {model} снят, продолжаем отправку промпта {prompt_data['id']}")
+                
                 # Проверяем лимит еще раз после ожидания
                 if self.message_monitor.is_model_limited(model):
-                    print(f"Лимит для модели {model} все еще активен после ожидания")
+                    message = f"Лимит для модели {model} все еще активен после ожидания"
+                    print(message)
+                    
+                    if self.logger:
+                        self.logger.log_app_event("LIMIT_PERSISTS", message, "WARNING", 
+                                                {"prompt_id": prompt_data['id'], "model": model})
+                        
                     # Отмечаем промпт как ожидающий и возвращаем False для повторного добавления в очередь 
                     self.message_monitor.table_manager.mark_pending(prompt_data['id'])
                     return False
@@ -61,22 +91,48 @@ class TelegramNavigator:
             if not self.message_monitor.set_current_task(prompt_data['id'], prompt_data['prompt'], model, slot):
                 # Если не удалось установить запрос (возможно, лимит), отмечаем промпт как ожидающий
                 self.message_monitor.table_manager.mark_pending(prompt_data['id'])
+                
+                if self.logger:
+                    self.logger.log_app_event("TASK_SET_FAILED", 
+                                            f"Не удалось установить запрос для промпта {prompt_data['id']} в слоте {slot}",
+                                            "ERROR")
                 return False
 
             # Отправляем команду /video и сразу модель
+            if self.logger:
+                self.logger.log_outgoing("/video", self.config.get('bot_name', 'Unknown'), "COMMAND")
+                
             await self.client.send_message(self.bot, '/video')
+            
+            if self.logger:
+                self.logger.log_outgoing(model, self.config.get('bot_name', 'Unknown'), "MODEL",
+                                      {"model_number": model_number})
+                
             await self.client.send_message(self.bot, model)
             await asyncio.sleep(0.5)
 
             # Отправляем промпт
             print(f"Отправлен промпт (Слот {slot}): {prompt_data['prompt']}")
+            
+            if self.logger:
+                self.logger.log_outgoing(prompt_data['prompt'], self.config.get('bot_name', 'Unknown'), "PROMPT",
+                                      {"prompt_id": prompt_data['id'], "slot": slot})
+                
             await self.client.send_message(self.bot, prompt_data['prompt'])
 
             print(f"Ожидание получения видео (Слот {slot})...")
+            if self.logger:
+                self.logger.log_app_event("WAITING_VIDEO", f"Ожидание получения видео в слоте {slot}")
+                
             return await self.message_monitor.wait_for_video(slot)
 
         except Exception as e:
-            print(f"Ошибка при навигации в слоте {slot}: {e}")
+            error_message = f"Ошибка при навигации в слоте {slot}: {e}"
+            print(error_message)
+            
+            if self.logger:
+                self.logger.log_exception(e, context=f"При навигации для промпта {prompt_data['id']} в слоте {slot}")
+                
             return False
             
     async def wait_for_limit_release(self, model=None):

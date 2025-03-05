@@ -8,19 +8,21 @@ from prompt_matcher import PromptMatcher
 import re
 
 class MessageMonitor:
-    def __init__(self, client, bot, video_downloader, config):
+    def __init__(self, client, bot, video_downloader, config, logger=None):
         self.client = client
         self.bot = bot
         self.video_downloader = video_downloader
         self.table_manager = video_downloader.table_manager
+        self.config = config
+        self.logger = logger  # Сохраняем переданный логгер
         self.max_slots = int(config.get('parallel_requests', '1'))
         self.active_requests = {}  # slot: {prompt_id, model, event}
         self.message_filter = MessageFilter()
         self.message_logger = MessageLogger()
         self.wait_time = int(config.get('wait_time_minutes', '20')) * 60
-        self.current_prompt = None
-        self.current_model = None
-        self.video_received = asyncio.Event()
+        self.current_prompt = {}  # slot: prompt_id
+        self.current_model = {}   # slot: model
+        self.video_received = {}  # slot: asyncio.Event()
         self.expected_filepath = None
         self.generation_in_progress = False
         self.error_received = False
@@ -42,6 +44,7 @@ class MessageMonitor:
         self.max_model_limit = 2  # Максимум 2 одновременно обрабатываемых промпта для модели
         self.waiting_for_any_video = False  # Флаг ожидания любого видео при лимите
         self.any_video_received = asyncio.Event()  # Событие для отслеживания получения любого видео
+        self.last_video_info = None
         
         # Сообщения о генерации
         self.generation_start_messages = [
@@ -63,12 +66,19 @@ class MessageMonitor:
             "Максимальное количество одновременных генераций"
         ]
 
+        if self.logger:
+            self.logger.log_app_event("MONITOR_INIT", "Инициализирован монитор сообщений")
+
     def increase_model_counter(self, model):
-        """Увеличивает счетчик активных запросов для модели"""
+        """Увеличивает счетчик использования модели"""
         if model not in self.model_limits:
             self.model_limits[model] = 0
         self.model_limits[model] += 1
         print(f"Увеличен счетчик модели {model}: {self.model_limits[model]}/{self.max_model_limit}")
+        
+        if self.logger:
+            self.logger.log_app_event("MODEL_COUNTER", f"Увеличен счетчик модели {model}", 
+                                    extra_info={"value": self.model_limits[model]})
         
     def decrease_model_counter(self, model):
         """Уменьшает счетчик активных запросов для модели"""
@@ -90,24 +100,34 @@ class MessageMonitor:
                     self.any_video_received.set()
 
     def set_model_limit(self, model):
-        """Устанавливает максимальный лимит для модели"""
-        self.model_limits[model] = self.max_model_limit
+        """Устанавливает флаг лимита для модели"""
+        self.model_limits[model] = self.model_limits.get(model, 0) + 1
         print(f"Установлен максимальный лимит для модели {model}: {self.model_limits[model]}/{self.max_model_limit}")
+        
+        if self.logger:
+            self.logger.log_model_limit(model, self.model_limits[model])
 
     def is_model_limited(self, model):
         """Проверяет, достигла ли модель лимита запросов"""
         return self.model_limits.get(model, 0) >= self.max_model_limit
 
     def set_current_task(self, prompt_id, prompt, model, slot):
-        """Устанавливает текущий запрос для слота"""
-        # Проверяем, есть ли лимит для данной модели
+        """Устанавливает текущий обрабатываемый промпт и модель"""
+        # Проверяем, не находится ли модель в состоянии лимита
         if self.is_model_limited(model):
-            print(f"Модель {model} достигла лимита запросов ({self.model_limits[model]}/{self.max_model_limit})")
+            if self.logger:
+                self.logger.log_app_event("MODEL_LIMITED", 
+                                        f"Модель {model} находится в состоянии лимита (значение: {self.model_limits.get(model, 0)})",
+                                        "WARNING")
             return False
-            
-        # Увеличиваем счетчик активных запросов для модели
-        self.increase_model_counter(model)
         
+        # Сбрасываем статус получения видео для слота
+        if slot in self.video_received:
+            self.video_received[slot].clear()
+        
+        # Сохраняем информацию о текущем задании
+        self.current_prompt[slot] = prompt_id
+        self.current_model[slot] = model
         self.active_requests[slot] = {
             'prompt_id': prompt_id,
             'prompt': prompt,
@@ -116,6 +136,15 @@ class MessageMonitor:
             'limit_detected': False  # Добавляем флаг для отслеживания лимита
         }
         print(f"Ожидается обработка промпта {prompt_id} в слоте {slot}")
+        
+        # Увеличиваем счетчик использования модели
+        self.increase_model_counter(model)
+        
+        if self.logger:
+            self.logger.log_app_event("TASK_SET", 
+                                    f"Установлена задача в слоте {slot}: промпт {prompt_id}, модель {model}",
+                                    extra_info={"prompt_preview": prompt[:50]+"..." if len(prompt) > 50 else prompt})
+        
         return True
 
     async def wait_for_video(self, slot):
@@ -167,13 +196,28 @@ class MessageMonitor:
     async def start_monitoring(self):
         @self.client.on(events.NewMessage(from_users=self.bot))
         async def handler(event):
-            message_text = event.message.text or ''
-            print(f"Получено сообщение: {message_text}")
+            # Получаем текст сообщения и флаг наличия видео
+            message_text = event.message.text or ""
+            has_video = bool(event.message.media and hasattr(event.message.media, 'document') and 
+                             event.message.media.document.mime_type.startswith('video/'))
             
-            has_video = bool(event.message.media and 
-                           hasattr(event.message.media, 'document') and 
-                           event.message.media.document.mime_type.startswith('video/'))
-
+            # Проверяем, нужно ли логировать/обрабатывать сообщение
+            if not self.message_filter.should_print_message(message_text, has_video) and not has_video:
+                return  # Пропускаем неинтересные сообщения
+            
+            # Форматируем сообщение для вывода
+            formatted_message = self.message_filter.format_message(message_text, has_video)
+            
+            # Логируем полученное сообщение
+            if self.logger:
+                media_type = "VIDEO" if has_video else None
+                self.logger.log_incoming(
+                    message=message_text,
+                    sender=self.config.get('bot_name', 'Unknown'),
+                    has_media=has_video,
+                    media_type=media_type
+                )
+            
             # Проверяем сообщение о лимите
             if any(msg in message_text for msg in self.limit_messages):
                 print("Обнаружено сообщение о лимите запросов")
@@ -193,99 +237,68 @@ class MessageMonitor:
 
             # Обрабатываем видео - всегда скачиваем, независимо от промпта
             if has_video:
-                # Определяем модель из текста сообщения или предыдущего контекста
-                model_name = None
+                print("\nПолучено видео!")
                 
-                # Ищем модель в формате "🧮 Модель: #Sora" или "Модель: #Sora"
-                model_patterns = [
-                    r'(?:\*\*)?🧮\s+Модель:(?:\*\*)?\s+`?#?([^`\n]+)`?',
-                    r'Модель:\s+`?#?([^`\n]+)`?'
-                ]
+                # Извлекаем модель из текста сообщения
+                model = self.video_downloader.extract_model_from_text(message_text)
                 
-                for pattern in model_patterns:
-                    model_match = re.search(pattern, message_text, re.IGNORECASE)
-                    if model_match:
-                        model_text = model_match.group(1).strip()
-                        if model_text.lower() == 'sora':
-                            model_name = '🌙 SORA'
-                        elif any(m in model_text.lower() for m in ['hailuo', 'minimax']):
-                            model_name = '➕ Hailuo MiniMax'
-                        elif any(m in model_text.lower() for m in ['runway', 'gen-3']):
-                            model_name = '📦 RunWay: Gen-3'
-                        elif 'kling' in model_text.lower():
-                            model_name = '🎬 Kling 1.6'
-                        elif 'pika' in model_text.lower():
-                            model_name = '🎯 Pika 2.0'
-                        elif any(m in model_text.lower() for m in ['act-one', 'аватары']):
-                            model_name = '👁 Act-One (Аватары 2.0)'
-                        elif 'luma' in model_text.lower():
-                            model_name = '🌫 Luma: DM'
-                        elif 'стилизатор' in model_text.lower():
-                            model_name = '🦋 RW: Стилизатор'
-                        print(f"Извлечена модель из сообщения: {model_name}")
-                        break
+                # Пытаемся загрузить видео
+                success = await self.video_downloader.download_any_video(event.message, model)
                 
-                # Если модель не найдена в формате "Модель:", ищем её по ключевым словам
-                if not model_name:
-                    # Поиск названий моделей в тексте сообщения
-                    message_lower = message_text.lower()
-                    models_map = {
-                        'sora': '🌙 SORA',
-                        'hailuo': '➕ Hailuo MiniMax',
-                        'minimax': '➕ Hailuo MiniMax',
-                        'runway': '📦 RunWay: Gen-3',
-                        'gen-3': '📦 RunWay: Gen-3',
-                        'kling': '🎬 Kling 1.6',
-                        'pika': '🎯 Pika 2.0',
-                        'act-one': '👁 Act-One (Аватары 2.0)',
-                        'аватары': '👁 Act-One (Аватары 2.0)',
-                        'luma': '🌫 Luma: DM',
-                        'стилизатор': '🦋 RW: Стилизатор'
+                if success:
+                    # Получаем информацию о загруженном видео
+                    file_path = self.video_downloader.last_saved_filepath
+                    file_name = file_path.split('\\')[-1] if '\\' in file_path else file_path.split('/')[-1]
+                    
+                    if self.logger:
+                        # Попытка получить prompt_id из имени файла
+                        prompt_id = None
+                        if "_" in file_name:
+                            parts = file_name.split('_')
+                            if len(parts) > 1 and len(parts[1]) == 8:  # Обычно ID промпта имеет 8 символов
+                                prompt_id = parts[1]
+                        
+                        self.logger.log_video_downloaded(
+                            prompt_id=prompt_id or "unknown",
+                            filename=file_name,
+                            model=model or "unknown",
+                            success=True
+                        )
+                        
+                    # Для любого слота, который ожидает видео, уведомляем о получении
+                    for slot in list(self.active_requests.keys()):
+                        request = self.active_requests[slot]  # Добавляем определение переменной request
+                        # Если модель запроса совпадает с моделью видео, считаем это успешной обработкой
+                        if model and model in self.model_limits:
+                            print(f"Отмечаем обработку промпта {request['prompt_id']} для модели {model}")
+                        request['event'].set()
+                    
+                    # Устанавливаем событие получения видео
+                    self.any_video_received.set()
+                    
+                    # Сохраняем информацию о последнем видео
+                    self.last_video_info = {
+                        "file_path": file_path,
+                        "model": model,
+                        "message_text": message_text
                     }
                     
-                    # Ищем упоминания моделей в тексте сообщения
-                    for key, model in models_map.items():
-                        if key in message_lower:
-                            model_name = model
-                            break
-                        
-                # Если модель не найдена в тексте, берем из активных запросов
-                if not model_name and self.active_requests:
-                    # Берем модель из первого активного запроса
-                    first_request = next(iter(self.active_requests.values()))
-                    model_name = first_request['model']
-                    
-                print(f"Получено видео для модели: {model_name if model_name else 'неизвестно'}")
-                
-                # Уменьшаем счетчик только для определенной модели
-                if model_name and model_name in self.model_limits:
-                    print(f"Уменьшаем счетчик для модели {model_name}")
-                    self.decrease_model_counter(model_name)
+                    # Проверяем, был ли сброшен лимит для модели после получения видео
+                    if model and model in self.model_limits:
+                        del self.model_limits[model]
+                        if self.logger:
+                            self.logger.log_app_event("LIMIT_RESET", 
+                                                   f"Сброшен лимит для модели {model} после получения видео")
                 else:
-                    # Если модель не определена, уменьшаем для всех активных моделей
-                    print("Модель не определена, уменьшаем счетчики для всех моделей")
-                    for model in list(self.model_limits.keys()):
-                        self.decrease_model_counter(model)
-                
-                # Сигнализируем о получении видео для ожидающих слотов
-                if self.waiting_for_any_video:
-                    self.any_video_received.set()
-                
-                # Если кто-то ждет освобождения слота
-                if self.waiting_for_slot:
-                    print("Сигнализируем об освобождении слота")
-                    self.slot_freed.set()
-                
-                # Скачиваем видео и передаем определенную модель
-                await self.video_downloader.download_any_video(event.message, model_name)
-                
-                # Отмечаем события для всех активных запросов, так как видео пришло
-                for slot, request in list(self.active_requests.items()):
-                    # Если модель запроса совпадает с моделью видео, считаем это успешной обработкой
-                    if model_name and request['model'] == model_name:
-                        print(f"Отмечаем обработку промпта {request['prompt_id']} для модели {model_name}")
-                    request['event'].set()
-                    
+                    print("Ошибка при загрузке видео")
+                    if self.logger:
+                        self.logger.log_video_downloaded(
+                            prompt_id="unknown",
+                            filename="failed_download",
+                            model=model or "unknown",
+                            success=False,
+                            error="Не удалось загрузить видео"
+                        )
                 return
 
             # Проверяем сообщения об ожидании (как положительный признак начала генерации)
@@ -327,7 +340,8 @@ class MessageMonitor:
     def reset_current_task(self):
         self.waiting_for_response = False
         self.last_sent_prompt = None
-        self.current_prompt = None
+        self.current_prompt = {}
+        self.current_model = {}
         self.expected_prompt = None
         self.received_video_prompt = None
         self.generation_in_progress = False

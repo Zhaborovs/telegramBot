@@ -5,8 +5,10 @@ import re
 from datetime import datetime
 
 class VideoDownloader:
-    def __init__(self, table_manager, config):
+    def __init__(self, table_manager, config, logger=None):
         self.table_manager = table_manager
+        self.config = config
+        self.logger = logger
         self.base_path = config.get('downloads_path', 'downloaded_videos')
         self.retry_attempts = int(config.get('retry_attempts', '3'))
         self.download_path = "downloaded_videos"
@@ -17,6 +19,8 @@ class VideoDownloader:
         # Создаем папку для видео, если её нет
         if not os.path.exists(self.download_path):
             os.makedirs(self.download_path)
+            if self.logger:
+                self.logger.log_app_event("DIRECTORY_CREATED", f"Создана директория для видео: {self.download_path}")
         
     def sanitize_filename(self, filename):
         # Удаляем недопустимые символы из имени файла
@@ -42,21 +46,40 @@ class VideoDownloader:
             filepath = os.path.join(self.base_path, filename)
             
             print(f"Начинаю скачивание видео: {filename}")
+            if self.logger:
+                self.logger.log_app_event("DOWNLOAD_START", f"Начинаем скачивание видео для промпта {prompt_id}",
+                                      extra_info={"filename": filename, "model": model})
+                
             await message.download_media(filepath)
             await asyncio.sleep(2)
             
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
                 print(f"Видео успешно сохранено: {filepath}")
                 self.table_manager.mark_completed(prompt_id, model, filepath)
+                
+                if self.logger:
+                    self.logger.log_video_downloaded(prompt_id, filename, model, success=True)
+                    
                 return True
             else:
-                print("Ошибка: файл не был создан или пустой")
+                error_message = "Ошибка: файл не был создан или пустой"
+                print(error_message)
                 self.table_manager.mark_error(prompt_id, model)
+                
+                if self.logger:
+                    self.logger.log_video_downloaded(prompt_id, filename, model, success=False, error=error_message)
+                    
                 return False
                 
         except Exception as e:
-            print(f"Ошибка при скачивании видео: {e}")
+            error_message = f"Ошибка при скачивании видео: {e}"
+            print(error_message)
             self.table_manager.mark_error(prompt_id, model)
+            
+            if self.logger:
+                self.logger.log_video_downloaded(prompt_id, filename, model, success=False, error=str(e))
+                self.logger.log_exception(e, context=f"При скачивании видео для промпта {prompt_id}")
+                
             return False
         finally:
             self.current_download = None
@@ -267,6 +290,11 @@ class VideoDownloader:
             filepath = os.path.join(self.base_path, filename)
             
             print(f"Скачивание видео для промпта {prompt_id if prompt_id else 'неизвестно'} с моделью {model}: {filename}")
+            if self.logger:
+                self.logger.log_app_event("DOWNLOAD_START", 
+                                      f"Скачивание видео для промпта {prompt_id if prompt_id else 'неизвестно'}", 
+                                      extra_info={"model": model, "filename": filename})
+                
             await message.download_media(filepath)
             
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
@@ -274,18 +302,42 @@ class VideoDownloader:
                 self.last_saved_filepath = filepath
                 self.last_download_success = True
                 
+                if self.logger:
+                    self.logger.log_video_downloaded(
+                        prompt_id=prompt_id or "unknown",
+                        filename=filename,
+                        model=model,
+                        success=True
+                    )
+                
                 # Отмечаем промпт как завершенный, если он был найден
                 if prompt_id:
                     self.table_manager.mark_completed(prompt_id, model, filepath)
                 return True
             else:
-                print("Ошибка: файл не был создан или пустой")
+                error_message = "Ошибка: файл не был создан или пустой"
+                print(error_message)
                 self.last_download_success = False
+                
+                if self.logger:
+                    self.logger.log_video_downloaded(
+                        prompt_id=prompt_id or "unknown",
+                        filename=filename,
+                        model=model,
+                        success=False,
+                        error=error_message
+                    )
+                    
                 return False
                 
         except Exception as e:
-            print(f"Ошибка при скачивании видео: {e}")
+            error_message = f"Ошибка при скачивании видео: {e}"
+            print(error_message)
             self.last_download_success = False
+            
+            if self.logger:
+                self.logger.log_exception(e, context="При скачивании видео без привязки к промпту")
+                
             return False
 
     async def start_monitoring(self):
