@@ -107,9 +107,32 @@ class TableManager:
         """Отмечает промпт как ожидающий загрузки видео"""
         self.update_status(prompt_id, self.STATUS_WAITING_DOWNLOAD, model=model)
 
-    def mark_error(self, prompt_id, model=''):
-        """Отмечает ошибку при обработке промпта"""
-        self.update_status(prompt_id, self.STATUS_ERROR, model=model)
+    def mark_error(self, prompt_id, model='', error_message=''):
+        """
+        Отмечает ошибку при обработке промпта
+        
+        Args:
+            prompt_id: ID промпта
+            model: Модель, для которой произошла ошибка
+            error_message: Сообщение об ошибке (опционально)
+        """
+        rows = self._read_table()
+        for row in rows:
+            if row['id'] == prompt_id:
+                row['status'] = self.STATUS_ERROR
+                if model:
+                    row['model'] = model
+                row['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Добавляем информацию об ошибке в поле video_path
+                if error_message:
+                    error_info = f"ERROR: {error_message[:100]}"
+                    row['video_path'] = error_info
+                else:
+                    row['video_path'] = "ERROR: Неизвестная ошибка"
+                    
+        self._write_table(rows)
+        print(f"❌ Промпт {prompt_id} отмечен как завершившийся с ошибкой")
 
     def mark_completed(self, prompt_id, model='', video_path=''):
         """Отмечает успешное завершение обработки промпта"""

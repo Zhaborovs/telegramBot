@@ -117,6 +117,12 @@ async def run_client():
         
         print("\nПодключено к Telegram")
         
+        # Создание директории для загрузки видео
+        downloads_path = config.get('downloads_path', 'downloaded_videos')
+        os.makedirs(downloads_path, exist_ok=True)
+        if advanced_logger:
+            advanced_logger.log_app_event("DIRECTORY_CHECK", f"Проверена директория для видео: {downloads_path}")
+        
         # Создание компонентов с конфигом
         table_manager = TableManager(config)
         video_downloader = VideoDownloader(table_manager, config, advanced_logger)

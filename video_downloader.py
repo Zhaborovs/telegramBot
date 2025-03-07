@@ -3,18 +3,21 @@ import asyncio
 from telethon import events
 import re
 from datetime import datetime
+import hashlib
+import gc
 
 class VideoDownloader:
-    def __init__(self, table_manager, config, logger=None):
+    def __init__(self, table_manager, config, client=None, logger=None):
         self.table_manager = table_manager
         self.config = config
         self.logger = logger
-        self.base_path = config.get('downloads_path', 'downloaded_videos')
+        self.client = client  # Сразу сохраняем client при инициализации
+        self.download_path = config.get('downloads_path', 'downloaded_videos')
         self.retry_attempts = int(config.get('retry_attempts', '3'))
-        self.download_path = "downloaded_videos"
         self.last_download_success = False
         self.last_saved_filepath = None
         self.current_download = None
+        self.message_monitor = None  # Ссылка на MessageMonitor добавится потом
         
         # Создаем папку для видео, если её нет
         if not os.path.exists(self.download_path):
@@ -40,50 +43,81 @@ class VideoDownloader:
         return f"{timestamp}_{prompt_id}_{model_name}.mp4"
     
     async def download_video(self, message, prompt_id, model):
+        """
+        Скачивает видео из сообщения
+        
+        Args:
+            message: Сообщение с видео
+            prompt_id: ID промпта
+            model: Модель генерации
+            
+        Returns:
+            bool: True если успешно, False если ошибка
+        """
         try:
-            self.current_download = prompt_id
-            filename = self.get_video_filename(prompt_id, model)
-            filepath = os.path.join(self.base_path, filename)
-            
-            print(f"Начинаю скачивание видео: {filename}")
-            if self.logger:
-                self.logger.log_app_event("DOWNLOAD_START", f"Начинаем скачивание видео для промпта {prompt_id}",
-                                      extra_info={"filename": filename, "model": model})
-                
-            await message.download_media(filepath)
-            await asyncio.sleep(2)
-            
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                print(f"Видео успешно сохранено: {filepath}")
-                self.table_manager.mark_completed(prompt_id, model, filepath)
-                
-                if self.logger:
-                    self.logger.log_video_downloaded(prompt_id, filename, model, success=True)
-                    
-                return True
+            # Генерируем имя файла
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_name = model.split()[0].replace('🌙', '').replace('➕', '').replace('📦', '')\
+                         .replace('🎬', '').replace('🎯', '').replace('👁', '')\
+                         .replace('🌫', '').replace('🦋', '').strip()
+                         
+            # Получаем статус промпта
+            prompt_status = self.table_manager.get_status(prompt_id)
+            if prompt_status:
+                prompt = prompt_status.get('prompt', '')
+                # Берем первые 5 слов из промпта для имени файла
+                if prompt:
+                    prompt_short = self.get_first_5_words(prompt)
+                    prompt_short = self.sanitize_filename(prompt_short)
+                else:
+                    prompt_short = ""
             else:
-                error_message = "Ошибка: файл не был создан или пустой"
-                print(error_message)
-                self.table_manager.mark_error(prompt_id, model)
+                prompt_short = ""
                 
-                if self.logger:
-                    self.logger.log_video_downloaded(prompt_id, filename, model, success=False, error=error_message)
-                    
-                return False
+            # Формируем имя файла
+            file_name = f"{timestamp}_{prompt_id}_{model_name}_{prompt_short}.mp4"
+            file_path = os.path.join(self.download_path, file_name)
+            
+            print(f"ℹ️ Информация о видео: {message.media.document.mime_type}, размер: {message.media.document.size} байт")
+            print(f"⏳ Начинаем загрузку видео в файл: {file_path}")
+            
+            # Получаем клиент для загрузки
+            from telethon import TelegramClient
+            client = None
+            if hasattr(self, 'client') and isinstance(self.client, TelegramClient):
+                client = self.client
+            elif self.message_monitor and hasattr(self.message_monitor, 'client'):
+                client = self.message_monitor.client
                 
-        except Exception as e:
-            error_message = f"Ошибка при скачивании видео: {e}"
-            print(error_message)
-            self.table_manager.mark_error(prompt_id, model)
+            # Ожидаем загрузку файла
+            await message.download_media(file_path)
+            
+            print(f"✅ Видео успешно загружено: {file_path}")
             
             if self.logger:
-                self.logger.log_video_downloaded(prompt_id, filename, model, success=False, error=str(e))
+                self.logger.log_video_downloaded(prompt_id, file_path, model, True)
+                
+            # Отмечаем в таблице
+            self.table_manager.mark_completed(prompt_id, model, file_path)
+            
+            self.last_download_success = True
+            self.last_saved_filepath = file_path
+            return True
+            
+        except Exception as e:
+            error_message = f"❌ Ошибка при скачивании видео: {str(e)}"
+            print(error_message)
+            
+            if self.logger:
+                self.logger.log_video_downloaded(prompt_id, "", model, False, str(e))
                 self.logger.log_exception(e, context=f"При скачивании видео для промпта {prompt_id}")
                 
-            return False
-        finally:
-            self.current_download = None
+            # Отмечаем ошибку в таблице
+            self.table_manager.mark_error(prompt_id, model, str(e))
             
+            self.last_download_success = False
+            return False
+    
     def extract_model_from_text(self, message_text):
         """Извлекает имя модели из текста сообщения"""
         if not message_text:
@@ -142,206 +176,102 @@ class VideoDownloader:
         
         return None
         
-    async def download_any_video(self, message, model_name=None):
-        """Скачивает видео без привязки к конкретному промпту, обрабатывая все активные запросы"""
+    async def download_any_video(self, message):
+        """
+        Скачивает любое видео без привязки к конкретному промпту
+        
+        Args:
+            message: Сообщение с видео
+            
+        Returns:
+            bool: True если успешно, False если ошибка
+        """
         try:
-            # Извлекаем текст сообщения для поиска промпта
-            message_text = message.text or ''
+            # Пробуем извлечь промпт из сообщения
+            extracted_text = ""
+            if message.text:
+                extracted_text = message.text
             
-            # Получаем список активных промптов из таблицы
-            all_prompts = self.table_manager.get_all_prompts()
-            active_prompts = self.table_manager.get_active_prompts()
-            prompt_id = None
-            model = model_name or 'unknown'
-            prompt_text = None
-            found_prompt = None
+            # Пробуем извлечь модель
+            model = self.extract_model_from_text(extracted_text)
+            if not model:
+                model = "Unknown"
+                
+            # Извлекаем ID сообщения как ID промпта
+            prompt_id = str(message.id)
             
-            # Извлекаем промпт из сообщения, если есть формат "📍 Ваш запрос:" или "**📍 Ваш запрос:**"
-            extracted_prompt = None
-            prompt_patterns = [
-                r'(?:\*\*)?📍\s+Ваш\s+запрос:(?:\*\*)?\s+`?(.*?)`?(?=\n|$)',
-                r'Ваш\s+запрос:\s+`?(.*?)`?(?=\n|$)'
-            ]
+            # Генерируем имя файла
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_name = model.split()[0].replace('🌙', '').replace('➕', '').replace('📦', '')\
+                         .replace('🎬', '').replace('🎯', '').replace('👁', '')\
+                         .replace('🌫', '').replace('🦋', '').strip()
             
-            for pattern in prompt_patterns:
-                prompt_match = re.search(pattern, message_text, re.IGNORECASE | re.DOTALL)
+            # Формируем сокращенный промпт для имени файла
+            prompt_short = "unknown"
+            if extracted_text:
+                # Выбираем текст после "Ваш запрос:" если есть
+                prompt_match = re.search(r'Ваш запрос:?\s*`?(.*?)`?$', extracted_text, re.MULTILINE)
                 if prompt_match:
-                    extracted_prompt = prompt_match.group(1).strip()
-                    print(f"Извлечен промпт из сообщения: '{extracted_prompt[:50]}...'")
-                    break
-            
-            # Если нашли промпт в сообщении, ищем совпадение в таблице
-            if extracted_prompt:
-                # Сначала ищем точное совпадение
-                for prompt in all_prompts:
-                    table_prompt_text = prompt.get('prompt', '')
-                    # Проверяем на точное совпадение или аналогичный текст (без учета регистра)
-                    if table_prompt_text and (
-                        table_prompt_text.lower() == extracted_prompt.lower() or
-                        table_prompt_text.lower() in extracted_prompt.lower() or
-                        extracted_prompt.lower() in table_prompt_text.lower()
-                    ):
-                        found_prompt = prompt
-                        prompt_text = table_prompt_text
-                        print(f"Найдено точное совпадение промпта: '{prompt_text[:50]}...' (ID: {found_prompt['id']})")
-                        break
-                
-                # Если точное совпадение не найдено, используем нечеткое совпадение
-                if not found_prompt:
-                    best_match = None
-                    best_ratio = 0
-                    for prompt in all_prompts:
-                        table_prompt_text = prompt.get('prompt', '')
-                        if not table_prompt_text:
-                            continue
-                            
-                        # Простая метрика совпадения: количество общих слов
-                        table_words = set(table_prompt_text.lower().split())
-                        extracted_words = set(extracted_prompt.lower().split())
-                        
-                        if not table_words or not extracted_words:
-                            continue
-                            
-                        common_words = table_words & extracted_words
-                        ratio = len(common_words) / max(len(table_words), len(extracted_words))
-                        
-                        if ratio > best_ratio and ratio > 0.5:  # Считаем совпадением, если более 50% слов совпадают
-                            best_ratio = ratio
-                            best_match = prompt
-                    
-                    if best_match:
-                        found_prompt = best_match
-                        prompt_text = found_prompt.get('prompt', '')
-                        print(f"Найдено нечеткое совпадение промпта: '{prompt_text[:50]}...' (ID: {found_prompt['id']}), совпадение: {best_ratio:.2f}")
-            
-            # Если промпт не найден ни в тексте, ни через сопоставление, пытаемся найти по модели
-            if not found_prompt and model_name and active_prompts:
-                matching_prompts = [p for p in active_prompts if p.get('model') == model_name]
-                if matching_prompts:
-                    found_prompt = matching_prompts[0]  # Берем первый совпадающий по модели
-                    prompt_text = found_prompt.get('prompt', '')
-                    print(f"Найден активный промпт для модели {model_name}: '{prompt_text[:50]}...' (ID: {found_prompt['id']})")
+                    prompt_text = prompt_match.group(1).strip()
+                    prompt_short = self.get_first_5_words(prompt_text)
+                    prompt_short = self.sanitize_filename(prompt_short)
                 else:
-                    # Если нет совпадений по модели, берем первый активный
-                    found_prompt = active_prompts[0]
-                    prompt_text = found_prompt.get('prompt', '')
-                    print(f"Взят первый активный промпт: '{prompt_text[:50]}...' (ID: {found_prompt['id']})")
+                    # Если не нашли, берем первые 5 слов из всего текста
+                    prompt_short = self.get_first_5_words(extracted_text)
+                    prompt_short = self.sanitize_filename(prompt_short)
             
-            # Если промпт найден, используем его ID
-            if found_prompt:
-                prompt_id = found_prompt['id']
-                
-                # Если модель не задана, используем модель из промпта
-                if not model_name:
-                    model = found_prompt.get('model', 'unknown')
-                
-                # Извлекаем модель из сообщения (если не задана)
-                if model == 'unknown' and message_text:
-                    extracted_model = self.extract_model_from_text(message_text)
-                    if extracted_model:
-                        model = extracted_model
-                        print(f"Извлечена модель из сообщения: {model}")
-                
-                # Генерируем имя файла на основе промпта
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                model_short = model.split()[0].replace('🌙', '').replace('➕', '').replace('📦', '')\
-                            .replace('🎬', '').replace('🎯', '').replace('👁', '')\
-                            .replace('🌫', '').replace('🦋', '').strip()
-                
-                # Создаем имя файла на основе найденного промпта
-                # Если у нас есть извлеченный промпт из сообщения, используем его для имени файла
-                if extracted_prompt:
-                    prompt_for_filename = extracted_prompt
-                else:
-                    prompt_for_filename = prompt_text
-                
-                # Очищаем от спецсимволов и получаем первые 5 слов
-                prompt_words = self.get_first_5_words(prompt_for_filename)
-                prompt_words = self.sanitize_filename(prompt_words)
-                
-                filename = f"{timestamp}_{prompt_id}_{model_short}_{prompt_words}.mp4"
-            else:
-                # Если промпт не найден, сохраняем с временным именем, но пытаемся извлечь из сообщения
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                
-                # Если модель не определена, пытаемся извлечь из сообщения
-                if model == 'unknown' and message_text:
-                    extracted_model = self.extract_model_from_text(message_text)
-                    if extracted_model:
-                        model = extracted_model
-                        print(f"Извлечена модель из сообщения для неизвестного промпта: {model}")
-                
-                # Получаем короткое имя модели
-                model_short = model.split()[0].replace('🌙', '').replace('➕', '').replace('📦', '')\
-                            .replace('🎬', '').replace('🎯', '').replace('👁', '')\
-                            .replace('🌫', '').replace('🦋', '').strip()
-                
-                # Если удалось извлечь промпт из сообщения, используем его в имени файла
-                if extracted_prompt:
-                    prompt_words = self.get_first_5_words(extracted_prompt)
-                    prompt_words = self.sanitize_filename(prompt_words)
-                    filename = f"unknown_{timestamp}_{model_short}_{prompt_words}.mp4"
-                else:
-                    filename = f"unknown_{timestamp}_{model_short}.mp4"
-                
-                print(f"Промпт не найден в таблице, сохраняем видео как: {filename}")
+            # Формируем имя файла
+            file_name = f"{timestamp}_{prompt_id}_{model_name}_{prompt_short}.mp4"
+            file_path = os.path.join(self.download_path, file_name)
             
-            # Создаем путь к файлу и скачиваем видео
-            filepath = os.path.join(self.base_path, filename)
+            print(f"ℹ️ Информация о видео: {message.media.document.mime_type}, размер: {message.media.document.size} байт")
+            print(f"⏳ Начинаем загрузку произвольного видео в файл: {file_path}")
             
-            print(f"Скачивание видео для промпта {prompt_id if prompt_id else 'неизвестно'} с моделью {model}: {filename}")
+            # Получаем клиент для загрузки
+            from telethon import TelegramClient
+            client = None
+            if hasattr(self, 'client') and isinstance(self.client, TelegramClient):
+                client = self.client
+            elif self.message_monitor and hasattr(self.message_monitor, 'client'):
+                client = self.message_monitor.client
+                
+            # Скачиваем файл
+            await message.download_media(file_path)
+            
+            print(f"✅ Видео успешно загружено: {file_path}")
+            
+            # Логируем успешную загрузку
             if self.logger:
-                self.logger.log_app_event("DOWNLOAD_START", 
-                                      f"Скачивание видео для промпта {prompt_id if prompt_id else 'неизвестно'}", 
-                                      extra_info={"model": model, "filename": filename})
-                
-            await message.download_media(filepath)
+                self.logger.log_app_event("VIDEO_DOWNLOADED", 
+                                        f"Загружено произвольное видео: {file_path}", 
+                                        extra_info={"prompt_id": prompt_id, "model": model})
             
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                print(f"Видео успешно сохранено: {filepath}")
-                self.last_saved_filepath = filepath
-                self.last_download_success = True
-                
-                if self.logger:
-                    self.logger.log_video_downloaded(
-                        prompt_id=prompt_id or "unknown",
-                        filename=filename,
-                        model=model,
-                        success=True
-                    )
-                
-                # Отмечаем промпт как завершенный, если он был найден
-                if prompt_id:
-                    self.table_manager.mark_completed(prompt_id, model, filepath)
-                return True
-            else:
-                error_message = "Ошибка: файл не был создан или пустой"
-                print(error_message)
-                self.last_download_success = False
-                
-                if self.logger:
-                    self.logger.log_video_downloaded(
-                        prompt_id=prompt_id or "unknown",
-                        filename=filename,
-                        model=model,
-                        success=False,
-                        error=error_message
-                    )
-                    
-                return False
-                
+            # Сохраняем информацию о последнем скачивании
+            self.last_download_success = True
+            self.last_saved_filepath = file_path
+            return True
+            
         except Exception as e:
-            error_message = f"Ошибка при скачивании видео: {e}"
+            error_message = f"❌ Ошибка при скачивании произвольного видео: {str(e)}"
             print(error_message)
-            self.last_download_success = False
             
             if self.logger:
-                self.logger.log_exception(e, context="При скачивании видео без привязки к промпту")
-                
+                self.logger.log_app_event("VIDEO_ERROR", 
+                                        f"Ошибка загрузки произвольного видео: {str(e)}", 
+                                        "ERROR")
+                self.logger.log_exception(e, context="При скачивании произвольного видео")
+            
+            self.last_download_success = False
             return False
 
     async def start_monitoring(self):
-        @self.client.on(events.NewMessage(from_users=self.bot))
+        # Проверяем, активен ли монитор сообщений
+        if hasattr(self, 'monitoring_active') and self.monitoring_active:
+            return
+        
+        self.monitoring_active = True
+        
+        @self.client.on(events.NewMessage(chats=self.bot))
         async def handler(event):
             # Проверяем, есть ли видео в сообщении
             if event.message.media and hasattr(event.message.media, 'document'):
@@ -358,7 +288,39 @@ class VideoDownloader:
                         # Сбрасываем промпт и модель после скачивания
                         self.current_prompt = None
                         self.current_model = None
-    
+
+        @self.client.on(events.MessageEdited(chats=self.bot))
+        async def edited_handler(event):
+            # Обработка отредактированных сообщений
+            try:
+                message_text = event.message.text or ""
+                has_video = (hasattr(event.message, 'media') and 
+                             event.message.media and 
+                             hasattr(event.message.media, 'document') and 
+                             event.message.media.document.mime_type.startswith('video/'))
+                
+                # Проверяем, нужно ли обрабатывать это сообщение
+                from message_filter import MessageFilter
+                message_filter = MessageFilter()
+                if not message_filter.should_process_edited_message(message_text, has_video):
+                    return
+                
+                # Если есть видео в отредактированном сообщении
+                if has_video:
+                    # Определяем модель из текста сообщения
+                    model = self.extract_model_from_text(message_text)
+                    
+                    # Если есть текущий промпт, скачиваем видео
+                    current_prompt = self.get_current_prompt()
+                    if current_prompt:
+                        await self.download_video(event.message, current_prompt, model)
+                        if self.logger:
+                            self.logger.log_app_event("VIDEO_DOWNLOADED_EDITED", 
+                                                   f"Скачано видео из отредактированного сообщения для промпта: {current_prompt[:30]}...")
+            except Exception as e:
+                if self.logger:
+                    self.logger.log_exception(e, context="При обработке отредактированного сообщения в VideoDownloader")
+
     def set_current_prompt(self, prompt, model):
         self.current_prompt = prompt
         self.current_model = model 
