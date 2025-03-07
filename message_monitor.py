@@ -6,28 +6,70 @@ from message_filter import MessageFilter
 from message_logger import MessageLogger
 from prompt_matcher import PromptMatcher
 import re
+import time
 
 class MessageMonitor:
-    def __init__(self, client, bot, video_downloader, config):
+    def __init__(self, client, bot, video_downloader, config, logger=None):
+        """
+        Инициализирует монитор сообщений
+        
+        Args:
+            client: Телеграм-клиент
+            bot: Бот для отправки сообщений
+            video_downloader: Загрузчик видео, содержащий table_manager
+            config: Конфигурация
+            logger: Логгер для записи событий
+        """
         self.client = client
         self.bot = bot
         self.video_downloader = video_downloader
-        self.table_manager = video_downloader.table_manager
+        self.table_manager = video_downloader.table_manager if hasattr(video_downloader, 'table_manager') else None
+        
+        # Передаем client в video_downloader
+        if hasattr(self.video_downloader, 'set_client'):
+            self.video_downloader.set_client(client)
+            self.video_downloader.message_monitor = self
+            if logger:
+                logger.log_app_event("INIT", "Client установлен для video_downloader")
+        
+        self.config = config
+        self.logger = logger  # Сохраняем переданный логгер
         self.max_slots = int(config.get('parallel_requests', '1'))
         self.active_requests = {}  # slot: {prompt_id, model, event}
         self.message_filter = MessageFilter()
         self.message_logger = MessageLogger()
-        self.wait_time = int(config.get('wait_time_minutes', '20')) * 60
-        self.current_prompt = None
-        self.current_model = None
-        self.video_received = asyncio.Event()
+        
+        # Время ожидания видео в секундах (из конфига)
+        wait_minutes = int(config.get('wait_time_minutes', '20'))
+        self.wait_time = wait_minutes * 60  # Конвертируем минуты в секунды
+        
+        self.current_prompt = {}  # slot: prompt_id
+        self.current_model = {}   # slot: model
+        self.video_received = {}  # slot: filename
         self.expected_filepath = None
         self.generation_in_progress = False
         self.error_received = False
         self.prompt_history = []  # История промптов только для текущей сессии
         self.current_video_prompt = None  # Промпт из сообщения с видео
-        self.expected_prompt = None  # Промпт, который мы ожидаем
-        self.received_video_prompt = None  # Промпт из полученного видео
+        
+        # Флаг активности мониторинга
+        self.monitoring_active = False
+        
+        # Регулярное выражение для поиска промптов
+        self.prompt_pattern = re.compile(r'\*\*📍 Ваш запрос:\*\* `(.+?)`', re.DOTALL)
+        
+        # Инициализация словарей
+        self.current_prompt = {}  # Текущие промпты по слотам
+        self.current_model = {}   # Текущие модели по слотам
+        self.video_received = {}  # Флаги получения видео по слотам
+        
+        # Активные запросы со всей информацией
+        self.active_requests = {}
+        
+        self.max_model_limit = 2  # Максимум 2 одновременно обрабатываемых промпта для модели
+        self.waiting_for_any_video = False  # Флаг ожидания любого видео при лимите
+        self.any_video_received = asyncio.Event()  # Событие для отслеживания получения любого видео
+        self.last_video_info = None
         self.current_request_id = None  # ID текущего запроса
         self.current_request_time = None  # Время отправки текущего запроса
         self.last_sent_prompt = None  # Последний отправленный нами промпт
@@ -38,12 +80,13 @@ class MessageMonitor:
         self.startup_cleanup = False  # Флаг для очистки слотов при старте
         self.waiting_for_slot = False  # Флаг ожидания освобождения слота
         self.slot_freed = asyncio.Event()  # Событие для отслеживания освобождения слота
-        
-        # События для каждого слота
-        self.generation_start_events = {}  # slot: event для отслеживания начала генерации
-        
-        # Добавляем детальные статусы
-        self.slot_status = {}  # slot: {status, last_update_time, message_count}
+        self.model_limits = {}  # Словарь для отслеживания счетчиков лимитов моделей
+        self.generation_in_progress = False
+        self.error_received = False
+        self.prompt_history = []  # История промптов только для текущей сессии
+        self.current_video_prompt = None  # Промпт из сообщения с видео
+        self.expected_prompt = None  # Промпт, который мы ожидаем
+        self.received_video_prompt = None  # Промпт из полученного видео
         
         # Сообщения о генерации
         self.generation_start_messages = [
@@ -51,508 +94,672 @@ class MessageMonitor:
             "Генерирую видео",
             "⏳ Генерация видео",
             "⚡ Задача ожидает выполнения",
-            "⏳ Одну секунду"  # Добавляем сообщение "Одну секунду" как подтверждение начала генерации
+            "⏳ Одну секунду"  # Добавляем сообщение ожидания
         ]
         
-        # Добавляем статусы для более детального отслеживания
-        self.STATUS_IDLE = 'idle'  # Слот свободен
-        self.STATUS_SENDING_PROMPT = 'sending_prompt'  # Отправка промпта
-        self.STATUS_WAITING_CONFIRMATION = 'waiting_confirmation'  # Ожидание подтверждения
-        self.STATUS_GENERATING = 'generating'  # Идет генерация
-        self.STATUS_WAITING_VIDEO = 'waiting_video'  # Ожидание видео
-        self.STATUS_ERROR = 'error'  # Ошибка
-        self.STATUS_LIMIT_REACHED = 'limit_reached'  # Достигнут лимит
-        
-        # Сообщения о лимите
-        self.limit_messages = [
-            "Максимальное количество одновременных генераций",
-            "ULTRA ELITE: 1 (временно/temporary)"
-        ]
-        
-        # Сообщения об ошибках
+        # Только критические ошибки, требующие повторной отправки
         self.error_messages = [
-            "Ошибка генерации",
-            "Error",
-            "Failed"
+            "Ошибка генерации"
         ]
 
+        # Обновляем сообщения о лимите
+        self.limit_messages = [
+            "⚠️ Достигнут лимит одновременных запросов",
+            "Максимальное количество одновременных генераций"
+        ]
+
+        if self.logger:
+            self.logger.log_app_event("MONITOR_INIT", "Инициализирован монитор сообщений")
+
+    def increase_model_counter(self, model):
+        """Увеличивает счетчик использования модели"""
+        if model not in self.model_limits:
+            self.model_limits[model] = 0
+        self.model_limits[model] += 1
+        print(f"Увеличен счетчик модели {model}: {self.model_limits[model]}/{self.max_model_limit}")
+        
+        if self.logger:
+            self.logger.log_app_event("MODEL_COUNTER", f"Увеличен счетчик модели {model}", 
+                                    extra_info={"value": self.model_limits[model]})
+        
+    def decrease_model_counter(self, model):
+        """Уменьшает счетчик использования модели на 1"""
+        if model in self.model_limits and self.model_limits[model] > 0:
+            self.model_limits[model] -= 1
+            print(f"Уменьшен счетчик модели {model}: {self.model_limits[model]}/{self.max_model_limit}")
+            
+            # Если счетчик был на максимуме и теперь уменьшился, сигнализируем об освобождении слота
+            if self.model_limits[model] == self.max_model_limit - 1:
+                print(f"Лимит для модели {model} снят (счетчик уменьшен с {self.max_model_limit} до {self.model_limits[model]})")
+                # Если кто-то ждет освобождения слота
+                if self.waiting_for_slot:
+                    print("Сигнализируем об освобождении слота для модели")
+                    self.slot_freed.set()
+                    
+                # Если ожидаем любое видео для снятия лимита
+                if self.waiting_for_any_video:
+                    print("Сигнализируем о снятии лимита для модели")
+                    self.any_video_received.set()
+
+    def set_model_limit(self, model):
+        """Устанавливает флаг лимита для модели"""
+        self.model_limits[model] = self.model_limits.get(model, 0) + 1
+        print(f"Установлен максимальный лимит для модели {model}: {self.model_limits[model]}/{self.max_model_limit}")
+        
+        if self.logger:
+            self.logger.log_model_limit(model, self.model_limits[model])
+
+    def is_model_limited(self, model):
+        """Проверяет, достигла ли модель лимита запросов"""
+        return self.model_limits.get(model, 0) >= self.max_model_limit
+
     def set_current_task(self, prompt_id, prompt, model, slot):
-        """Устанавливает текущую задачу для слота"""
-        if slot is None:
-            print("Ошибка: не указан слот для задачи")
+        """
+        Устанавливает текущую задачу
+        
+        Args:
+            prompt_id: ID промпта
+            prompt: Текст промпта
+            model: Модель для генерации
+            slot: Номер слота
+            
+        Returns:
+            bool: True если успешно, False в случае ошибки
+        """
+        # Проверяем, не находится ли модель в состоянии лимита
+        if self.is_model_limited(model):
+            print(f"❌ Модель {model} достигла лимита запросов. Промпт {prompt_id} будет возвращен в очередь.")
+            
+            # Отмечаем промпт как ожидающий
+            table_manager = self.get_table_manager()
+            if table_manager:
+                table_manager.mark_pending(prompt_id)
+                
+                if self.logger:
+                    self.logger.log_app_event("MODEL_LIMITED", 
+                                            f"Модель {model} достигла лимита. Промпт {prompt_id} возвращен в очередь",
+                                            extra_info={"model": model, "prompt_id": prompt_id})
+                
             return False
             
-        # Создаем событие для отслеживания начала генерации
-        if slot not in self.generation_start_events:
-            self.generation_start_events[slot] = asyncio.Event()
-            
-        # Инициализируем статус слота, если его еще нет
-        if slot not in self.slot_status:
-            self.slot_status[slot] = {
-                'status': self.STATUS_IDLE,
-                'last_update_time': datetime.now(),
-                'message_count': 0,
-                'last_status_message': 'Инициализация'
-            }
-            
-        # Обновляем статус слота
-        self.slot_status[slot].update({
-            'status': self.STATUS_SENDING_PROMPT,
-            'last_update_time': datetime.now(),
-            'last_status_message': f'Отправка промпта {prompt_id}'
-        })
+        # Инкрементируем счетчик для модели
+        self.increase_model_counter(model)
         
-        # Сохраняем информацию о текущем запросе
+        # Сохраняем информацию о текущей задаче
+        prompt_short = prompt[:30] + "..." if len(prompt) > 30 else prompt
+        
         self.active_requests[slot] = {
             'prompt_id': prompt_id,
             'prompt': prompt,
             'model': model,
-            'start_time': datetime.now(),
-            'event': asyncio.Event(),
-            'video_received': False,
-            'generation_started': False,
-            'limit_detected': False,
-            'error_detected': False,
-            'status_changes': [],  # История изменений статуса
-            'attempt_count': 0     # Счетчик попыток
+            'start_time': time.time(),
+            'sent_message_id': None,
+            'status': 'sending'
         }
         
-        # Добавляем первую запись в историю изменений
-        self.active_requests[slot]['status_changes'].append({
-            'time': datetime.now(), 
-            'status': self.STATUS_SENDING_PROMPT
-        })
+        # Отмечаем промпт как находящийся в обработке
+        table_manager = self.get_table_manager()
+        if table_manager:
+            table_manager.mark_in_progress(prompt_id, model)
+            
+            if self.logger:
+                self.logger.log_app_event("TASK_SET", 
+                                        f"Установлена задача для промпта {prompt_id} в слоте {slot}",
+                                        extra_info={"model": model, "slot": slot, "prompt": prompt_short})
         
-        print(f"Ожидается обработка промпта {prompt_id} в слоте {slot}")
+        print(f"Увеличен счетчик модели {model}: {self.model_limits[model]}/{self.max_model_limit}")
         return True
 
     async def wait_for_video(self, slot):
-        """Ожидает получение видео для конкретного слота"""
-        if slot not in self.active_requests:
-            return False
-
-        request = self.active_requests[slot]
-        try:
-            # Обновляем статус
-            current_time = datetime.now()
-            if slot in self.slot_status:
-                self.slot_status[slot].update({
-                    'status': self.STATUS_WAITING_VIDEO,
-                    'last_update_time': current_time,
-                    'last_status_message': f'Ожидание видео для промпта {request["prompt_id"]}'
-                })
-                
-            # Обновляем историю изменений
-            request['status_changes'].append({
-                'time': current_time, 
-                'status': self.STATUS_WAITING_VIDEO
-            })
+        """
+        Ожидает получения видео для конкретного слота
+        
+        Args:
+            slot: Номер слота
             
-            # Ждем получения видео
-            await asyncio.wait_for(request['event'].wait(), timeout=self.wait_time)
+        Returns:
+            bool: True если видео получено, False если истек таймаут
+        """
+        if slot not in self.active_requests:
+            print(f"Ошибка: слот {slot} не активен")
+            return False
+            
+        request = self.active_requests[slot]
+        prompt_id = request['prompt_id']
+        model = request['model']
+        
+        print(f"Ожидаем видео для слота {slot}. Таймаут установлен на {self.wait_time} секунд ({self.wait_time/60} минут)")
+        
+        # Ожидаем получения видео
+        start_time = time.time()
+        
+        while time.time() - start_time < self.wait_time:
+            # Видео получено
+            if slot in self.video_received and self.video_received[slot]:
+                print(f"✅ Видео для слота {slot} получено!")
+                
+                # Отмечаем, что видео получено
+                self.video_received[slot] = False
+                
+                # Уменьшаем счетчик для модели
+                self.decrease_model_counter(model)
+                print(f"Уменьшен счетчик модели {model} после успешного получения видео: {self.model_limits[model]}/{self.max_model_limit}")
+                
+                # Освобождаем слот
+                if slot in self.active_requests:
+                    del self.active_requests[slot]
+                
+                return True
+                
+            # Получена ошибка
+            if self.error_received:
+                print(f"❌ Получена ошибка при генерации видео для слота {slot}")
+                self.error_received = False
+                
+                # Отмечаем промпт как завершившийся с ошибкой
+                table_manager = self.get_table_manager()
+                if table_manager:
+                    table_manager.mark_error(prompt_id, model, "Ошибка при генерации видео")
+                    
+                # Уменьшаем счетчик для модели
+                self.decrease_model_counter(model)
+                print(f"Уменьшен счетчик модели {model} после ошибки: {self.model_limits[model]}/{self.max_model_limit}")
+                
+                # Освобождаем слот
+                if slot in self.active_requests:
+                    del self.active_requests[slot]
+                
+                return False
+            
+            # Проверяем, не был ли слот освобожден извне
+            if slot not in self.active_requests:
+                print(f"Слот {slot} был освобожден во время ожидания")
+                return False
+                
+            # Небольшая пауза, чтобы не нагружать процессор
+            await asyncio.sleep(0.5)
+            
+        # Время ожидания истекло
+        print(f"⏰ Истекло время ожидания видео для слота {slot}")
+        
+        # Отмечаем промпт как таймаут
+        table_manager = self.get_table_manager()
+        if table_manager:
+            table_manager.mark_timeout(prompt_id, model)
+            
+        # Уменьшаем счетчик для модели
+        self.decrease_model_counter(model)
+        print(f"Уменьшен счетчик модели {model} из-за таймаута: {self.model_limits[model]}/{self.max_model_limit}")
+        
+        # Освобождаем слот
+        if slot in self.active_requests:
+            del self.active_requests[slot]
+            
+        return False
+
+    async def wait_for_any_video_received(self):
+        """Ожидает получение любого видео (для снятия лимита)"""
+        print("\nОжидаем получение любого видео для снятия лимита...")
+        self.waiting_for_any_video = True
+        self.any_video_received.clear()
+        try:
+            await asyncio.wait_for(self.any_video_received.wait(), timeout=self.wait_time)
+            print("Получено видео, лимиты для моделей уменьшены")
             return True
         except asyncio.TimeoutError:
-            print(f"Таймаут ожидания видео в слоте {slot}")
-            self.table_manager.mark_timeout(request['prompt_id'])
-            
-            # Обновляем статус при таймауте
-            if slot in self.slot_status:
-                self.slot_status[slot].update({
-                    'status': self.STATUS_ERROR,
-                    'last_update_time': datetime.now(),
-                    'last_status_message': f'Таймаут ожидания видео для промпта {request["prompt_id"]}'
-                })
-            
+            print("Таймаут ожидания видео для снятия лимита")
             return False
         finally:
-            # Очищаем слот
-            if slot in self.active_requests:
-                del self.active_requests[slot]
-                
-            # Сбрасываем статус слота
-            if slot in self.slot_status:
-                self.slot_status[slot].update({
-                    'status': self.STATUS_IDLE,
-                    'last_update_time': datetime.now(),
-                    'last_status_message': 'Слот освобожден'
-                })
-
-    async def wait_for_slot_release(self):
-        """Ожидает освобождения слота при достижении лимита"""
-        print("\nОжидаем освобождения слота...")
-        self.waiting_for_slot = True
-        self.slot_freed.clear()  # Сбрасываем событие перед ожиданием
-        
-        try:
-            await asyncio.wait_for(self.slot_freed.wait(), timeout=self.wait_time)
-            print("Слот освободился")
-            self.waiting_for_slot = False
-            return True
-        except asyncio.TimeoutError:
-            print("Таймаут ожидания освобождения слота")
-            self.waiting_for_slot = False
-            return False
+            self.waiting_for_any_video = False
 
     async def start_monitoring(self):
-        @self.client.on(events.NewMessage(from_users=self.bot))
+        # Устанавливаем флаг активности мониторинга
+        self.monitoring_active = True
+        
+        # Обработчик исходящих сообщений (от нас боту)
+        @self.client.on(events.NewMessage(outgoing=True, chats=self.bot))
+        async def outgoing_handler(event):
+            """Обработчик исходящих сообщений от нас боту"""
+            try:
+                message_text = event.message.text or ""
+                
+                # Логируем исходящее сообщение
+                if self.logger:
+                    self.logger.log_outgoing(message_text, self.bot.username, "TEXT")
+                
+                # Проверяем, является ли сообщение промптом
+                if len(message_text) > 20 and not message_text.startswith('/'):
+                    print(f"\nОтправлен промпт: {message_text[:30]}...")
+                    
+                    # Ищем активный слот для этого промпта
+                    for slot, request in self.active_requests.items():
+                        if request['prompt'] == message_text:
+                            # Сохраняем ID отправленного сообщения
+                            request['sent_message_id'] = event.message.id
+                            print(f"Промпт связан со слотом {slot}, ID сообщения: {event.message.id}")
+                            
+                            if self.logger:
+                                self.logger.log_app_event("PROMPT_SENT", 
+                                                      f"Отправлено сообщение с промптом {request['prompt_id']} (ID: {event.message.id})",
+                                                      extra_info={"message_id": event.message.id, "slot": slot})
+                            break
+            except Exception as e:
+                if self.logger:
+                    self.logger.log_exception(e, context="При обработке исходящего сообщения")
+        
+        @self.client.on(events.NewMessage(chats=self.bot))
         async def handler(event):
-            message_text = event.message.text or ''
-            
-            # Логируем все сообщения с тайм-штампом
-            timestamp = datetime.now().strftime('%H:%M:%S')
-            log_message = f"[{timestamp}] Сообщение от бота: {message_text[:100]}" + ("..." if len(message_text) > 100 else "")
-            print(log_message)
-            
-            # Записываем сообщение в лог
-            has_video = bool(event.message.media and 
-                           hasattr(event.message.media, 'document') and 
-                           event.message.media.document.mime_type.startswith('video/'))
-            self.message_logger.log_message(message_text, has_video)
-            
-            # Проверяем сообщение о готовности модели принять промпт
-            model_ready_patterns = [
-                r'отправьте.*текстовое задание',
-                r'загрузите изображение',
-                r'введите запрос',
-                r'тариф:.*0\.00'
-            ]
-            
-            is_model_ready = any(re.search(pattern, message_text.lower()) for pattern in model_ready_patterns)
-            if is_model_ready:
-                print("Обнаружено сообщение о готовности модели принять промпт")
-                # Это информационное сообщение, не требующее действий
-                # Просто обновляем статусы слотов
-                self.print_slot_statuses()
-                return
+            # Обработка входящих сообщений от бота
+            try:
+                message = event.message
+                message_text = message.text or message.message or ""
+                has_video = False
+                
+                # Проверяем, содержит ли сообщение видео
+                if message.media and hasattr(message.media, 'document') and \
+                   message.media.document.mime_type and message.media.document.mime_type.startswith('video/'):
+                    has_video = True
+                
+                if self.logger:
+                    extra_info = {"has_video": has_video}
+                    self.logger.log_incoming(message_text, "Bot", has_video, "VIDEO" if has_video else None, extra_info)
+                
+                # Если сообщение содержит видео, обрабатываем его
+                if has_video:
+                    print(f"\n🎬 ПОЛУЧЕНО ВИДЕО В СООБЩЕНИИ!")
+                    print(f"Содержимое сообщения: {message_text[:50]}...")
+                    
+                    # Находим слот по тексту сообщения (в нем содержится промпт)
+                    prompt_slot = self.find_slot_by_last_prompt(message_text)
+                    print(f"Найден слот по промпту: {prompt_slot}")
+                    
+                    if prompt_slot and prompt_slot in self.active_requests:
+                        prompt_id = self.active_requests[prompt_slot]['prompt_id']
+                        model = self.active_requests[prompt_slot]['model']
+                        
+                        print(f"Скачиваем видео для промпта {prompt_id}, модель {model}")
+                        
+                        if self.logger:
+                            self.logger.log_app_event("VIDEO_RECEIVED", 
+                                                     f"Получено видео для промпта {prompt_id} в слоте {prompt_slot}",
+                                                     extra_info={"model": model})
+                        
+                        # Скачиваем видео
+                        await self.video_downloader.download_video(message, prompt_id, model)
+                        
+                        # Уменьшаем счетчик использования модели после успешного скачивания
+                        self.decrease_model_counter(model)
+                        print(f"Уменьшен счетчик модели {model} после успешного получения видео: {self.model_limits[model]}/{self.max_model_limit}")
+                        
+                        # Уведомляем о получении видео для слота
+                        self.video_received[prompt_slot] = True
+                        
+                        # Сигнализируем о том, что видео получено и загружено
+                        if prompt_slot in self.active_requests and 'event' in self.active_requests[prompt_slot]:
+                            event_obj = self.active_requests[prompt_slot]['event']
+                            event_obj.set()
+                    else:
+                        # Если не смогли определить слот по промпту, пробуем по ID ответа
+                        for slot, request in self.active_requests.items():
+                            if 'status_message_id' in request and request['status_message_id'] == message.id:
+                                prompt_id = request['prompt_id']
+                                model = request['model']
+                                
+                                if self.logger:
+                                    self.logger.log_app_event("VIDEO_RECEIVED_BY_STATUS", 
+                                                            f"Получено видео для промпта {prompt_id} в слоте {slot}",
+                                                            extra_info={"model": model})
+                                
+                                # Скачиваем видео
+                                await self.video_downloader.download_video(message, prompt_id, model)
+                                
+                                # Уведомляем о получении видео для слота
+                                self.video_received[slot] = True
+                                
+                                # Сигнализируем о том, что видео получено и загружено
+                                if 'event' in request:
+                                    request['event'].set()
+                                break
+                        else:
+                            # Если не смогли определить слот ни по промпту, ни по ID, скачиваем видео со стандартным названием
+                            if self.logger:
+                                self.logger.log_app_event("VIDEO_RECEIVED_UNKNOWN", 
+                                                        "Получено видео, но не удалось определить промпт",
+                                                        "WARNING")
+                            
+                            # Скачиваем видео с неизвестным промптом
+                            await self.video_downloader.download_any_video(message)
+                
+                # Остальной код обработки сообщений...
+                print("\nПОЛУЧЕНО НОВОЕ СООБЩЕНИЕ")  # Отладочное сообщение
+                # Получаем текст сообщения и флаг наличия видео
+                message_text = event.message.text or ""
+                has_video = (event.message.media and hasattr(event.message.media, 'document') and 
+                            event.message.media.document.mime_type.startswith('video/'))
+                
+                print(f"Текст: {message_text[:50]}{'...' if len(message_text) > 50 else ''}")
+                print(f"Содержит видео: {has_video}")
+                
+                # Логируем входящее сообщение
+                if self.logger:
+                    media_type = None
+                    if has_video:
+                        media_type = "VIDEO"
+                    self.logger.log_incoming(message_text, "Bot", has_video, media_type)
+                
+                # Записываем сообщение в лог
+                self.message_logger.log_message(message_text, has_video)
+                
+                # Проверяем, нужно ли логировать/обрабатывать сообщение
+                if not self.message_filter.should_print_message(message_text, has_video) and not has_video:
+                    return  # Пропускаем неинтересные сообщения
+                
+                # Проверяем, является ли сообщение статусным (содержит "📍 Ваш запрос:" или "📍 Запрос:")
+                is_status_message = "📍 Ваш запрос:" in message_text or "📍 Запрос:" in message_text
 
-            # Проверяем сообщение о лимите
-            if any(msg in message_text for msg in self.limit_messages):
-                print("Обнаружено сообщение о лимите запросов")
-                # Возвращаем все активные промпты в очередь
-                for slot, request in list(self.active_requests.items()):
-                    if not request.get('limit_detected'):
-                        print(f"Лимит запросов в слоте {slot}")
-                        request['limit_detected'] = True
+                # Если это статусное сообщение, пытаемся найти соответствующий слот/промпт
+                if is_status_message:
+                    # Извлекаем текст промпта из сообщения
+                    prompt_match = re.search(r'📍 (?:Ваш )?запрос:\s*(.+)', message_text, re.IGNORECASE | re.DOTALL)
+                    if prompt_match:
+                        prompt_text = prompt_match.group(1).strip()
                         
-                        # Обновляем статус слота
-                        if slot in self.slot_status:
-                            self.slot_status[slot].update({
-                                'status': self.STATUS_LIMIT_REACHED,
-                                'last_update_time': datetime.now(),
-                                'last_status_message': f'Лимит запросов: {message_text[:50]}...'
-                            })
+                        # Ищем соответствующий слот
+                        for slot, request in self.active_requests.items():
+                            if request['prompt'].startswith(prompt_text[:30]) or prompt_text.startswith(request['prompt'][:30]):
+                                # Нашли соответствующий слот
+                                request['status_message_id'] = event.message.id
+                                
+                                if self.logger:
+                                    self.logger.log_app_event("STATUS_MESSAGE", 
+                                                            f"Найдено статусное сообщение для промпта {request['prompt_id']} в слоте {slot}",
+                                                            extra_info={"message_id": event.message.id})
+                                print(f"\n📊 Отслеживается статус для промпта {request['prompt_id']} (слот {slot})")
+                                break
+
+                # Проверяем на наличие ошибки в сообщении - используем patterns из MessageFilter
+                if any(error_pattern in message_text.lower() for error_pattern in self.message_filter.error_patterns):
+                    print("\n⚠️ Обнаружена ошибка в сообщении!")
+                    
+                    # Пытаемся определить слот по реплаю или содержимому
+                    slot = self.find_slot_by_reply(event.message) or self.find_slot_by_last_prompt(message_text)
+                    
+                    if slot:
+                        # Если нашли слот, отмечаем ошибку для этого промпта
+                        request = self.active_requests[slot]
+                        prompt_id = request['prompt_id']
                         
-                        # Обновляем историю изменений
-                        request['status_changes'].append({
-                            'time': datetime.now(), 
-                            'status': self.STATUS_LIMIT_REACHED
-                        })
+                        if self.logger:
+                            self.logger.log_app_event("VIDEO_ERROR", 
+                                                    f"Обнаружена ошибка генерации для промпта {prompt_id} в слоте {slot}",
+                                                    "ERROR", 
+                                                    {"error_text": message_text[:200]})
                         
-                        # Обновляем статус промпта
-                        self.table_manager.mark_limit_reached(request['prompt_id'], message_text)
+                        # Отмечаем промпт как пропущенный из-за ошибки
+                        self.table_manager.mark_error(request['prompt_id'], request['model'], message_text[:100])
+                        print(f"❌ Промпт {prompt_id} помечен как завершившийся с ошибкой")
                         
-                        # Сигнализируем о лимите событиям
-                        if slot in self.generation_start_events:
-                            self.generation_start_events[slot].set()
+                        # Уменьшаем счетчик использования модели
+                        self.decrease_model_counter(request['model'])
+                        
+                        # Устанавливаем событие для разблокировки ожидающего потока
                         request['event'].set()
-                        
-                        # Сообщаем об освобождении слота
-                        if self.waiting_for_slot:
-                            self.slot_freed.set()
-                            
-                # Печатаем статусы всех слотов после обнаружения лимита
-                self.print_slot_statuses()
-                return
+                        return
+                    else:
+                        # Если не смогли определить слот, ищем по контексту сообщения
+                        # Проверяем все активные запросы
+                        for active_slot, request in self.active_requests.items():
+                            # Если нашли упоминание промпта в сообщении об ошибке
+                            prompt_preview = request['prompt'][:30].lower()
+                            if prompt_preview in message_text.lower():
+                                prompt_id = request['prompt_id']
+                                
+                                if self.logger:
+                                    self.logger.log_app_event("VIDEO_ERROR_MATCHED", 
+                                                            f"Сопоставлена ошибка для промпта {prompt_id} в слоте {active_slot}",
+                                                            "ERROR", 
+                                                            {"error_text": message_text[:200]})
+                                
+                                # Отмечаем промпт как завершившийся с ошибкой
+                                self.table_manager.mark_error(request['prompt_id'], request['model'], message_text[:100])
+                                print(f"❌ Промпт {prompt_id} помечен как завершившийся с ошибкой (по содержимому)")
+                                
+                                # Уменьшаем счетчик использования модели
+                                self.decrease_model_counter(request['model'])
+                                
+                                # Устанавливаем событие
+                                request['event'].set()
+                                return
 
-            # Проверяем сообщения о начале генерации
-            if any(msg in message_text for msg in self.generation_start_messages):
-                print("Обнаружено сообщение о начале генерации видео")
-                
-                # Определяем, к какому слоту относится сообщение (на основе содержания)
-                matched_slot = None
-                matched_similarity = 0
-                
-                for slot, request in list(self.active_requests.items()):
-                    # Используем более точное сопоставление промптов
-                    similarity = self.prompt_matcher.calculate_similarity(request['prompt'], message_text)
-                    
-                    if similarity > 0.5 and similarity > matched_similarity:  # Порог сходства
-                        matched_slot = slot
-                        matched_similarity = similarity
-                        
-                # Если нашли подходящий слот
-                if matched_slot:
-                    slot = matched_slot
-                    request = self.active_requests[slot]
-                    
-                    if not request.get('generation_started'):
-                        print(f"Началась генерация видео в слоте {slot} (сходство: {matched_similarity:.2f})")
-                        
-                        # Обновляем статус слота
-                        if slot in self.slot_status:
-                            self.slot_status[slot].update({
-                                'status': self.STATUS_GENERATING,
-                                'last_update_time': datetime.now(),
-                                'last_status_message': f'Генерация видео для промпта {request["prompt_id"]}'
-                            })
-                        
-                        # Обновляем историю изменений
-                        request['status_changes'].append({
-                            'time': datetime.now(), 
-                            'status': self.STATUS_GENERATING
-                        })
-                        
-                        # Устанавливаем флаг и событие
-                        request['generation_started'] = True
-                        if slot in self.generation_start_events:
-                            self.generation_start_events[slot].set()
-                            
-                    # Печатаем статусы всех слотов
-                    self.print_slot_statuses()
+                # Проверяем сообщения об ожидании (как положительный признак начала генерации)
+                if any(msg in message_text for msg in self.generation_start_messages):
+                    self.generation_in_progress = True
+                    print("Началась генерация видео...")
                     return
                     
-                # Если не смогли определить слот, но получили сообщение о начале генерации
-                # возможно, оно относится к единственному активному запросу
-                if len(self.active_requests) == 1:
-                    slot, request = next(iter(self.active_requests.items()))
-                    if not request.get('generation_started'):
-                        print(f"Началась генерация видео в единственном активном слоте {slot}")
-                        
-                        # Обновляем статус слота
-                        if slot in self.slot_status:
-                            self.slot_status[slot].update({
-                                'status': self.STATUS_GENERATING,
-                                'last_update_time': datetime.now(),
-                                'last_status_message': f'Генерация видео для промпта {request["prompt_id"]}'
-                            })
-                        
-                        # Обновляем историю изменений
-                        request['status_changes'].append({
-                            'time': datetime.now(), 
-                            'status': self.STATUS_GENERATING
-                        })
-                        
-                        request['generation_started'] = True
-                        if slot in self.generation_start_events:
-                            self.generation_start_events[slot].set()
-                
-                self.generation_in_progress = True
-                # Печатаем статусы всех слотов
-                self.print_slot_statuses()
-                return
-
-            # Обрабатываем видео
-            if has_video:
-                print("Получено видео - слот должен освободиться")
-                
-                # Логируем параметры видео для отладки
-                video_info = ""
-                if hasattr(event.message.media, 'document'):
-                    video_info = f"Размер: {event.message.media.document.size} байт, "
-                    video_info += f"Название: {getattr(event.message.media.document, 'attributes', [])}"
-                print(f"Информация о видео: {video_info}")
-                
-                if self.waiting_for_slot:
-                    print("Сигнализируем об освобождении слота")
-                    self.slot_freed.set()
-                
-                # Проверяем, к какому запросу относится видео
-                matched_slot = None
-                best_similarity = 0
-                
-                for slot, request in list(self.active_requests.items()):
-                    # Пытаемся сопоставить видео с запросом
-                    similarity = self.prompt_matcher.calculate_similarity(request['prompt'], message_text)
-                    
-                    if similarity > 0.4 and similarity > best_similarity:  # Порог сходства для видео
-                        matched_slot = slot
-                        best_similarity = similarity
-                
-                # Если нашли соответствующий слот
-                if matched_slot:
-                    slot = matched_slot
-                    request = self.active_requests[slot]
-                    print(f"Видео соответствует запросу в слоте {slot} (сходство: {best_similarity:.2f})")
-                    
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_IDLE,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Получено видео для промпта {request["prompt_id"]}'
-                        })
-                    
-                    success = await self.video_downloader.download_video(
-                        event.message, 
-                        request['prompt_id'],
-                        request['model']
-                    )
-                    if success:
-                        print(f"Видео успешно загружено для промпта {request['prompt_id']}")
+                # Проверяем сообщения об ошибках
+                if any(msg in message_text for msg in self.error_messages):
+                    for slot, request in list(self.active_requests.items()):
+                        print(f"Получена ошибка от бота для слота {slot}")
+                        self.table_manager.mark_error(request['prompt_id'], request['model'])
+                        # Уменьшаем счетчик при ошибке
+                        self.decrease_model_counter(request['model'])
                         request['event'].set()
-                        # Печатаем статусы всех слотов
-                        self.print_slot_statuses()
-                        return
-                
-                # Если не смогли определить слот, но есть только один запрос
-                elif len(self.active_requests) == 1:
-                    slot, request = next(iter(self.active_requests.items()))
-                    print(f"Предполагаем, что видео соответствует единственному активному запросу в слоте {slot}")
-                    
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_IDLE,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Получено видео для промпта {request["prompt_id"]}'
-                        })
-                    
-                    success = await self.video_downloader.download_video(
-                        event.message, 
-                        request['prompt_id'],
-                        request['model']
-                    )
-                    if success:
-                        print(f"Видео успешно загружено для промпта {request['prompt_id']}")
-                        request['event'].set()
-                        # Печатаем статусы всех слотов
-                        self.print_slot_statuses()
-                        return
-                
-                # Если не смогли определить, для какого запроса это видео
-                print("Не удалось определить, к какому запросу относится видео")
-                # Пытаемся загрузить видео с общим идентификатором
-                success = await self.video_downloader.download_video(
-                    event.message, 
-                    f"unknown_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                    "unknown"
-                )
-                if success:
-                    print("Видео загружено с общим идентификатором")
-                
-                # Печатаем статусы всех слотов
-                self.print_slot_statuses()
-                return
+                    return
 
-            # Проверяем сообщения об ошибках
-            if any(msg in message_text for msg in self.error_messages):
-                print("Обнаружено сообщение об ошибке")
-                error_slot = None
+            except Exception as e:
+                if self.logger:
+                    self.logger.log_exception(e, context="При обработке входящего сообщения")
+
+        # Добавляем обработчик для отредактированных сообщений
+        @self.client.on(events.MessageEdited(chats=self.bot))
+        async def edited_handler(event):
+            # Обработка отредактированных сообщений
+            try:
+                message_text = event.message.text or ""
+                has_video = (hasattr(event.message, 'media') and 
+                            event.message.media and 
+                            hasattr(event.message.media, 'document') and 
+                            event.message.media.document.mime_type.startswith('video/'))
                 
-                # Пытаемся определить, к какому запросу относится ошибка
-                for slot, request in list(self.active_requests.items()):
-                    # Используем эвристику для сопоставления
-                    similarity = self.prompt_matcher.calculate_similarity(request['prompt'], message_text)
-                    
-                    if similarity > 0.3:  # Низкий порог для ошибок
-                        error_slot = slot
+                # Проверяем, соответствует ли отредактированное сообщение какому-либо статусному сообщению
+                matching_slot = None
+                for slot, request in self.active_requests.items():
+                    if 'status_message_id' in request and request['status_message_id'] == event.message.id:
+                        matching_slot = slot
                         break
                 
-                # Если определили слот
-                if error_slot:
-                    slot = error_slot
-                    request = self.active_requests[slot]
-                    print(f"Получена ошибка от бота для слота {slot}")
+                # Если нашли соответствующий слот для статусного сообщения
+                if matching_slot:
+                    if self.logger:
+                        self.logger.log_app_event("STATUS_UPDATE", 
+                                                f"Обновлен статус для промпта {self.active_requests[matching_slot]['prompt_id']} в слоте {matching_slot}")
                     
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_ERROR,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Ошибка: {message_text[:50]}...'
-                        })
-                    
-                    # Обновляем историю изменений
-                    request['status_changes'].append({
-                        'time': datetime.now(), 
-                        'status': self.STATUS_ERROR
-                    })
-                    
-                    self.table_manager.mark_error(request['prompt_id'], request['model'], message_text)
-                    request['event'].set()
-                    
-                    # Если ожидаем освобождения слота
-                    if self.waiting_for_slot:
-                        self.slot_freed.set()
+                    # Проверяем на наличие ошибки в обновленном статусе
+                    if any(error_pattern in message_text.lower() for error_pattern in self.message_filter.error_patterns):
+                        request = self.active_requests[matching_slot]
+                        prompt_id = request['prompt_id']
                         
-                # Если не смогли определить, но есть только один активный запрос
-                elif len(self.active_requests) == 1:
-                    slot, request = next(iter(self.active_requests.items()))
-                    print(f"Предполагаем, что ошибка относится к единственному активному запросу в слоте {slot}")
-                    
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_ERROR,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Ошибка: {message_text[:50]}...'
-                        })
-                    
-                    # Обновляем историю изменений
-                    request['status_changes'].append({
-                        'time': datetime.now(), 
-                        'status': self.STATUS_ERROR
-                    })
-                    
-                    self.table_manager.mark_error(request['prompt_id'], request['model'], message_text)
-                    request['event'].set()
-                    
-                    # Если ожидаем освобождения слота
-                    if self.waiting_for_slot:
-                        self.slot_freed.set()
+                        if self.logger:
+                            self.logger.log_app_event("VIDEO_ERROR_IN_STATUS", 
+                                                    f"Обнаружена ошибка в статусном сообщении для промпта {prompt_id} в слоте {matching_slot}",
+                                                    "ERROR", 
+                                                    {"error_text": message_text[:200]})
+                        
+                        # Отмечаем промпт как завершившийся с ошибкой
+                        self.table_manager.mark_error(request['prompt_id'], request['model'], message_text[:100])
+                        print(f"❌ Промпт {prompt_id} помечен как завершившийся с ошибкой (из статусного сообщения)")
+                        
+                        # Уменьшаем счетчик использования модели
+                        self.decrease_model_counter(request['model'])
+                        
+                        # Устанавливаем событие
+                        request['event'].set()
+                        return
                 
-                # Печатаем статусы всех слотов
-                self.print_slot_statuses()
-                return
+                # Используем новый метод для проверки, нужно ли обрабатывать отредактированное сообщение
+                if not self.message_filter.should_process_edited_message(message_text, has_video):
+                    # Добавляем логирование игнорируемых сообщений
+                    if self.logger and message_text:
+                        self.logger.log_app_event("IGNORED_EDIT", 
+                                               f"Игнорируется отредактированное сообщение: {message_text[:30]}...", 
+                                               "DEBUG")
+                    return
 
-            # Печатаем статусы всех слотов после каждого сообщения
-            self.print_slot_statuses()
+                # Продолжаем только если сообщение нужно обрабатывать
+                if self.logger:
+                    self.logger.log_incoming(f"[EDIT] {message_text}", "Bot", has_video, 
+                                          "VIDEO" if has_video else None)
+                
+                # Проверяем наличие ошибки в отредактированном сообщении
+                if any(error_pattern in message_text.lower() for error_pattern in self.message_filter.error_patterns):
+                    # Пытаемся определить слот по реплаю или содержимому
+                    slot = self.find_slot_by_reply(event.message) or self.find_slot_by_last_prompt(message_text)
+                    
+                    if slot:
+                        # Если нашли слот, отмечаем ошибку для этого промпта
+                        request = self.active_requests[slot]
+                        prompt_id = request['prompt_id']
+                        
+                        if self.logger:
+                            self.logger.log_app_event("VIDEO_ERROR", 
+                                                    f"Обнаружена ошибка генерации в отредактированном сообщении для промпта {prompt_id} в слоте {slot}",
+                                                    "ERROR", 
+                                                    {"error_text": message_text[:200]})
+                        
+                        # Отмечаем промпт как завершившийся с ошибкой
+                        self.table_manager.mark_error(request['prompt_id'], request['model'], message_text[:100])
+                        print(f"❌ Промпт {prompt_id} помечен как завершившийся с ошибкой (в отредактированном сообщении)")
+                        
+                        # Уменьшаем счетчик использования модели
+                        self.decrease_model_counter(request['model'])
+                        
+                        # Устанавливаем событие, чтобы разблокировать ожидающий поток
+                        request['event'].set()
+                        return
+                    else:
+                        # Если не смогли определить слот, ищем по контексту сообщения
+                        for active_slot, request in self.active_requests.items():
+                            prompt_preview = request['prompt'][:30].lower()
+                            if prompt_preview in message_text.lower():
+                                prompt_id = request['prompt_id']
+                                
+                                if self.logger:
+                                    self.logger.log_app_event("VIDEO_ERROR_MATCHED", 
+                                                           f"Сопоставлена ошибка для промпта {prompt_id} в слоте {active_slot}",
+                                                           "ERROR", 
+                                                           {"error_text": message_text[:200]})
+                                
+                                # Отмечаем промпт как завершившийся с ошибкой
+                                self.table_manager.mark_error(request['prompt_id'], request['model'], message_text[:100])
+                                print(f"❌ Промпт {prompt_id} помечен как завершившийся с ошибкой (по содержимому)")
+                                
+                                # Уменьшаем счетчик использования модели
+                                self.decrease_model_counter(request['model'])
+                                
+                                # Устанавливаем событие
+                                request['event'].set()
+                                return
+                
+                # Проверяем, содержит ли сообщение промпт
+                if "📍 Ваш запрос:" in message_text or "📍 Запрос:" in message_text:
+                    try:
+                        prompt_match = re.search(r'(?:📍 Ваш запрос:|📍 Запрос:)\s*(.+)', message_text)
+                        if prompt_match:
+                            self.received_video_prompt = prompt_match.group(1).strip()
+                            
+                            # Пытаемся найти слот по тексту промпта
+                            slot = self.find_slot_by_last_prompt(self.received_video_prompt)
+                            if slot and self.logger:
+                                self.logger.log_app_event("PROMPT_MATCHED", 
+                                                       f"Найден слот {slot} для промпта: {self.received_video_prompt[:30]}...")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.log_exception(e, context="При обработке промпта из отредактированного сообщения")
+                
+                # Обрабатываем видео, если оно есть в сообщении
+                if has_video:
+                    # Здесь код для обработки видео в отредактированном сообщении
+                    # Пытаемся найти слот по видео
+                    slot = None
+                    if self.received_video_prompt:
+                        slot = self.find_slot_by_last_prompt(self.received_video_prompt)
+                    
+                    if slot:
+                        # Обрабатываем видео для найденного слота
+                        request = self.active_requests[slot]
+                        video_path = await self.download_video(event.message)
+                        
+                        if video_path:
+                            # Проверяем соответствие видео промпту
+                            if self.check_video_matches_prompt(video_path, request['prompt']):
+                                # Обновляем статус и уведомляем ожидающий поток
+                                self.table_manager.mark_success(request['prompt_id'], request['model'])
+                                request['event'].set()
+                            else:
+                                # Видео не соответствует промпту
+                                if self.logger:
+                                    self.logger.log_app_event("VIDEO_MISMATCH",
+                                                           f"Видео не соответствует промпту для слота {slot}")
+                                self.table_manager.mark_error(request['prompt_id'], request['model'])
+                                request['event'].set()
 
-        # Запускаем обработчик сообщений
-        print("Мониторинг сообщений запущен")
+            except Exception as e:
+                if self.logger:
+                    self.logger.log_exception(e, context="При обработке отредактированного сообщения")
 
-    def clear_history(self):
-        """Очистка истории промптов при новом запуске"""
-        self.prompt_history = []
-        self.reset_current_task()
-
-    def get_expected_filename(self, prompt, model):
-        """Генерирует шаблон имени файла для текущего запроса"""
-        # Получаем первые 5 слов из промпта
-        words = prompt.split()[:5]
-        prompt_start = '_'.join(words)
-        # Очищаем от спецсимволов
-        prompt_start = ''.join(c if c.isalnum() or c in ['_', '-'] else '_' for c in prompt_start)
+    def find_slot_by_reply(self, message):
+        """Находит слот по реплаю на сообщение"""
+        if message.reply_to is None:
+            return None
         
-        # Возвращаем только часть с промптом для сравнения
-        return prompt_start
-
-    def check_video_matches_prompt(self, filename, expected_prompt):
-        """Проверяет соответствие видео ожидаемому промпту"""
-        return self.prompt_matcher.is_matching(filename, expected_prompt)
-
-    def reset_current_task(self):
-        self.waiting_for_response = False
-        self.last_sent_prompt = None
-        self.current_prompt = None
-        self.expected_prompt = None
-        self.received_video_prompt = None
-        self.generation_in_progress = False
-        self.error_received = False
-        self.expected_filename = None 
+        # Получаем ID сообщения, на которое отвечают
+        reply_to_msg_id = message.reply_to.reply_to_msg_id
+        
+        # Проверяем все активные запросы
+        for slot, request in self.active_requests.items():
+            if 'sent_message_id' in request and request['sent_message_id'] == reply_to_msg_id:
+                return slot
+            
+        return None
 
     def find_slot_by_last_prompt(self, message_text):
-        """Находит слот по промпту в сообщении об ошибке"""
-        for slot, request in self.active_requests.items():
-            if request['prompt'] in message_text:
-                return slot
-        return None 
+        """Находит слот по последнему промпту в сообщении"""
+        # Проверяем новый формат с маркдауном (жирный текст и обратные кавычки)
+        prompt_match = re.search(r'\*\*📍 (?:Ваш )?запрос:\*\* `([^`]+)`', message_text, re.IGNORECASE | re.DOTALL)
+        
+        # Если не нашли по новому формату, пробуем старый формат
+        if not prompt_match:
+            prompt_match = re.search(r'📍 (?:Ваш )?запрос:\s*(.+)', message_text, re.IGNORECASE | re.DOTALL)
+            
+        if prompt_match:
+            prompt_text = prompt_match.group(1).strip()
+            print(f"Извлечен текст промпта из сообщения: {prompt_text[:50]}...")
+            
+            # Ищем соответствующий слот
+            for slot, request in self.active_requests.items():
+                print(f"Сравниваем с промптом в слоте {slot}: {request['prompt'][:50]}...")
+                if request['prompt'].startswith(prompt_text[:30]) or prompt_text.startswith(request['prompt'][:30]):
+                    print(f"Найдено соответствие промпта в слоте {slot}!")
+                    return slot
+                
+                # Добавляем более гибкое сравнение с использованием частичного совпадения
+                similarity_threshold = 0.7  # Порог сходства (можно настроить)
+                prompt_words = set(request['prompt'].lower().split()[:20])  # Берем первые 20 слов
+                text_words = set(prompt_text.lower().split()[:20])
+                
+                common_words = prompt_words.intersection(text_words)
+                if len(common_words) >= min(len(prompt_words), len(text_words)) * similarity_threshold:
+                    print(f"Найдено частичное соответствие промпта в слоте {slot}!")
+                    return slot
+            
+        return None
 
     async def wait_for_any_video(self):
         """Ожидает получение любого видео для очистки слотов"""
         video_received = asyncio.Event()
         
-        @self.client.on(events.NewMessage(from_users=self.bot))
+        @self.client.on(events.NewMessage(chats=self.bot))
         async def temp_handler(event):
             if event.message.media and hasattr(event.message.media, 'document'):
                 if event.message.media.document.mime_type.startswith('video/'):
@@ -568,667 +775,67 @@ class MessageMonitor:
             return False
 
     async def cleanup_active_slots(self):
-        """Очищает занятые слоты при старте программы"""
-        if self.startup_cleanup:
-            return True
-            
-        active_prompts = self.table_manager.get_active_prompts()
-        if not active_prompts:
-            self.startup_cleanup = True
-            return True
-
-        print("\nОбнаружены активные слоты с прошлого запуска")
-        print("Ожидаем получение видео для очистки слотов...")
-        
-        success = await self.wait_for_any_video()
-        if success:
-            # Очищаем все активные промпты
-            for prompt in active_prompts:
-                self.table_manager.mark_pending(prompt['id'])
-            print("Слоты очищены")
-        else:
-            print("Не удалось дождаться видео, очищаем слоты принудительно")
-            for prompt in active_prompts:
-                self.table_manager.mark_timeout(prompt['id'])
-
-        self.startup_cleanup = True
-        return True 
-
-    async def wait_for_generation_start(self, slot, timeout=30):
-        """Ожидает сообщение о начале генерации видео"""
-        if slot not in self.active_requests or slot not in self.generation_start_events:
-            return False
-        
-        # Обновляем статус
-        if slot in self.slot_status:
-            self.slot_status[slot].update({
-                'status': self.STATUS_WAITING_CONFIRMATION,
-                'last_update_time': datetime.now(),
-                'last_status_message': f'Ожидание подтверждения начала генерации'
-            })
-        
-        # Обновляем историю изменений
-        request = self.active_requests[slot]
-        request['status_changes'].append({
-            'time': datetime.now(), 
-            'status': self.STATUS_WAITING_CONFIRMATION
-        })
-        
-        # Проверяем, не было ли уже получено подтверждение
-        if request.get('generation_started', False):
-            print(f"Генерация уже была подтверждена ранее для слота {slot}")
-            return True
-        
+        """Очищает активные слоты из прошлой сессии"""
         try:
-            # Сбрасываем событие перед ожиданием
-            self.generation_start_events[slot].clear()
+            print("Очистка активных слотов из прошлой сессии...")
             
-            # Ждем сообщение о начале генерации
-            print(f"Ожидаем подтверждения генерации в течение {timeout} секунд...")
-            await asyncio.wait_for(self.generation_start_events[slot].wait(), timeout=timeout)
-            
-            # Если дождались, обновляем статус
-            if slot in self.active_requests:
-                request = self.active_requests[slot]
-                self.table_manager.mark_generation_started(request['prompt_id'], request['model'])
-                request['generation_started'] = True
-                
-                # Обновляем историю изменений
-                request['status_changes'].append({
-                    'time': datetime.now(), 
-                    'status': self.STATUS_GENERATING
-                })
-                
-                # Обновляем статус слота
-                if slot in self.slot_status:
-                    self.slot_status[slot].update({
-                        'status': self.STATUS_GENERATING,
-                        'last_update_time': datetime.now(),
-                        'last_status_message': f'Генерация видео для промпта {request["prompt_id"]}'
-                    })
-                
-                return True
-        except asyncio.TimeoutError:
-            # Проверяем наличие лимита
-            if slot in self.active_requests and self.active_requests[slot].get('limit_detected', False):
-                # Обновляем статус слота
-                if slot in self.slot_status:
-                    self.slot_status[slot].update({
-                        'status': self.STATUS_LIMIT_REACHED,
-                        'last_update_time': datetime.now(),
-                        'last_status_message': f'Достигнут лимит запросов'
-                    })
-                return False
-                
-            print(f"Таймаут ожидания начала генерации в слоте {slot}")
-            
-            # Проверяем, не появилось ли видео, несмотря на отсутствие подтверждения
-            # Это может произойти, если сообщение о начале генерации было пропущено
-            if slot in self.active_requests:
-                # Обновляем статус слота на "ожидание видео" вместо ошибки
-                if slot in self.slot_status:
-                    self.slot_status[slot].update({
-                        'status': self.STATUS_WAITING_VIDEO,
-                        'last_update_time': datetime.now(),
-                        'last_status_message': f'Ожидание видео без подтверждения генерации'
-                    })
-                
-                # Обновляем историю изменений
-                request = self.active_requests[slot]
-                request['status_changes'].append({
-                    'time': datetime.now(), 
-                    'status': self.STATUS_WAITING_VIDEO
-                })
-                
-                print(f"Переходим к ожиданию видео без подтверждения генерации для слота {slot}")
-                return False
-            
-            # Обновляем статус слота
-            if slot in self.slot_status:
-                self.slot_status[slot].update({
-                    'status': self.STATUS_ERROR,
-                    'last_update_time': datetime.now(),
-                    'last_status_message': f'Таймаут ожидания подтверждения'
-                })
-            
-            return False
-    
-    def check_limit_detected(self, slot):
-        """Проверяет, был ли обнаружен лимит запросов для слота"""
-        return slot in self.active_requests and self.active_requests[slot].get('limit_detected', False)
-        
-    def get_slot_status(self, slot):
-        """Возвращает текущий статус слота"""
-        if slot in self.slot_status:
-            return self.slot_status[slot]
-        return None
-
-    def print_slot_statuses(self):
-        """Выводит статусы всех слотов"""
-        print("\nСтатусы слотов:")
-        for slot, status in self.slot_status.items():
-            status_message = f"Слот {slot}: {status['status']} - {status['last_status_message']} " \
-                            f"(обновлен {status['last_update_time'].strftime('%H:%M:%S')})"
-            print(status_message)
-            # Логируем статус слота
-            self.message_logger.log_slot_status(slot, status['status'], status['last_status_message'])
-
-    async def start_monitoring(self):
-        @self.client.on(events.NewMessage(from_users=self.bot))
-        async def handler(event):
-            message_text = event.message.text or ''
-            
-            # Логируем все сообщения с тайм-штампом
-            timestamp = datetime.now().strftime('%H:%M:%S')
-            log_message = f"[{timestamp}] Сообщение от бота: {message_text[:100]}" + ("..." if len(message_text) > 100 else "")
-            print(log_message)
-            
-            # Записываем сообщение в лог
-            has_video = bool(event.message.media and 
-                           hasattr(event.message.media, 'document') and 
-                           event.message.media.document.mime_type.startswith('video/'))
-            self.message_logger.log_message(message_text, has_video)
-            
-            # Проверяем сообщение о готовности модели принять промпт
-            model_ready_patterns = [
-                r'отправьте.*текстовое задание',
-                r'загрузите изображение',
-                r'введите запрос',
-                r'тариф:.*0\.00'
-            ]
-            
-            is_model_ready = any(re.search(pattern, message_text.lower()) for pattern in model_ready_patterns)
-            if is_model_ready:
-                print("Обнаружено сообщение о готовности модели принять промпт")
-                # Это информационное сообщение, не требующее действий
-                # Просто обновляем статусы слотов
-                self.print_slot_statuses()
-                return
-
-            # Проверяем сообщение о лимите
-            if any(msg in message_text for msg in self.limit_messages):
-                print("Обнаружено сообщение о лимите запросов")
-                # Возвращаем все активные промпты в очередь
-                for slot, request in list(self.active_requests.items()):
-                    if not request.get('limit_detected'):
-                        print(f"Лимит запросов в слоте {slot}")
-                        request['limit_detected'] = True
-                        
-                        # Обновляем статус слота
-                        if slot in self.slot_status:
-                            self.slot_status[slot].update({
-                                'status': self.STATUS_LIMIT_REACHED,
-                                'last_update_time': datetime.now(),
-                                'last_status_message': f'Лимит запросов: {message_text[:50]}...'
-                            })
-                        
-                        # Обновляем историю изменений
-                        request['status_changes'].append({
-                            'time': datetime.now(), 
-                            'status': self.STATUS_LIMIT_REACHED
-                        })
-                        
-                        # Обновляем статус промпта
-                        self.table_manager.mark_limit_reached(request['prompt_id'], message_text)
-                        
-                        # Сигнализируем о лимите событиям
-                        if slot in self.generation_start_events:
-                            self.generation_start_events[slot].set()
-                        request['event'].set()
-                        
-                        # Сообщаем об освобождении слота
-                        if self.waiting_for_slot:
-                            self.slot_freed.set()
+            # Получаем активные промпты
+            if self.table_manager:
+                active_prompts = self.table_manager.get_active_prompts()
+                if active_prompts:
+                    for prompt in active_prompts:
+                        prompt_id = prompt.get('id')
+                        slot = prompt.get('slot')
+                        if prompt_id and slot:
+                            print(f"Обнаружен активный слот {slot} для промпта {prompt_id} из прошлой сессии")
+                            if self.logger:
+                                self.logger.log_app_event("CLEANUP", 
+                                                        f"Очистка слота {slot} (промпт {prompt_id}) из прошлой сессии")
                             
-                # Печатаем статусы всех слотов после обнаружения лимита
-                self.print_slot_statuses()
-                return
-
-            # Проверяем сообщения о начале генерации
-            if any(msg in message_text for msg in self.generation_start_messages):
-                print("Обнаружено сообщение о начале генерации видео")
-                
-                # Определяем, к какому слоту относится сообщение (на основе содержания)
-                matched_slot = None
-                matched_similarity = 0
-                
-                for slot, request in list(self.active_requests.items()):
-                    # Используем более точное сопоставление промптов
-                    similarity = self.prompt_matcher.calculate_similarity(request['prompt'], message_text)
-                    
-                    if similarity > 0.5 and similarity > matched_similarity:  # Порог сходства
-                        matched_slot = slot
-                        matched_similarity = similarity
-                        
-                # Если нашли подходящий слот
-                if matched_slot:
-                    slot = matched_slot
-                    request = self.active_requests[slot]
-                    
-                    if not request.get('generation_started'):
-                        print(f"Началась генерация видео в слоте {slot} (сходство: {matched_similarity:.2f})")
-                        
-                        # Обновляем статус слота
-                        if slot in self.slot_status:
-                            self.slot_status[slot].update({
-                                'status': self.STATUS_GENERATING,
-                                'last_update_time': datetime.now(),
-                                'last_status_message': f'Генерация видео для промпта {request["prompt_id"]}'
-                            })
-                        
-                        # Обновляем историю изменений
-                        request['status_changes'].append({
-                            'time': datetime.now(), 
-                            'status': self.STATUS_GENERATING
-                        })
-                        
-                        # Устанавливаем флаг и событие
-                        request['generation_started'] = True
-                        if slot in self.generation_start_events:
-                            self.generation_start_events[slot].set()
+                            self.table_manager.mark_error(prompt_id, "", "Прервано при перезапуске бота")
+                            print(f"Слот {slot} очищен и промпт {prompt_id} помечен как завершенный с ошибкой")
+            elif hasattr(self.video_downloader, 'table_manager'):
+                # Если table_manager не был установлен напрямую, но есть в video_downloader
+                table_manager = self.video_downloader.table_manager
+                active_prompts = table_manager.get_active_prompts()
+                if active_prompts:
+                    for prompt in active_prompts:
+                        prompt_id = prompt.get('id')
+                        slot = prompt.get('slot')
+                        if prompt_id and slot:
+                            print(f"Обнаружен активный слот {slot} для промпта {prompt_id} из прошлой сессии")
+                            if self.logger:
+                                self.logger.log_app_event("CLEANUP", 
+                                                        f"Очистка слота {slot} (промпт {prompt_id}) из прошлой сессии")
                             
-                    # Печатаем статусы всех слотов
-                    self.print_slot_statuses()
-                    return
-                    
-                # Если не смогли определить слот, но получили сообщение о начале генерации
-                # возможно, оно относится к единственному активному запросу
-                if len(self.active_requests) == 1:
-                    slot, request = next(iter(self.active_requests.items()))
-                    if not request.get('generation_started'):
-                        print(f"Началась генерация видео в единственном активном слоте {slot}")
-                        
-                        # Обновляем статус слота
-                        if slot in self.slot_status:
-                            self.slot_status[slot].update({
-                                'status': self.STATUS_GENERATING,
-                                'last_update_time': datetime.now(),
-                                'last_status_message': f'Генерация видео для промпта {request["prompt_id"]}'
-                            })
-                        
-                        # Обновляем историю изменений
-                        request['status_changes'].append({
-                            'time': datetime.now(), 
-                            'status': self.STATUS_GENERATING
-                        })
-                        
-                        request['generation_started'] = True
-                        if slot in self.generation_start_events:
-                            self.generation_start_events[slot].set()
+                            table_manager.mark_error(prompt_id, "", "Прервано при перезапуске бота")
+                            print(f"Слот {slot} очищен и промпт {prompt_id} помечен как завершенный с ошибкой")
+            else:
+                print("Внимание: table_manager не доступен, очистка активных слотов не выполнена")
+                if self.logger:
+                    self.logger.log_app_event("WARNING", 
+                                            "table_manager не доступен, очистка активных слотов не выполнена",
+                                            "WARNING")
+                                            
+            # Очищаем активные слоты
+            self.active_requests = {}
+            if self.logger:
+                self.logger.log_app_event("CLEANUP_COMPLETE", "Очистка активных слотов завершена")
                 
-                self.generation_in_progress = True
-                # Печатаем статусы всех слотов
-                self.print_slot_statuses()
-                return
+        except Exception as e:
+            print(f"Ошибка при очистке активных слотов: {e}")
+            if self.logger:
+                self.logger.log_exception(e, context="При очистке активных слотов")
 
-            # Обрабатываем видео
-            if has_video:
-                print("Получено видео - слот должен освободиться")
-                
-                # Логируем параметры видео для отладки
-                video_info = ""
-                if hasattr(event.message.media, 'document'):
-                    video_info = f"Размер: {event.message.media.document.size} байт, "
-                    video_info += f"Название: {getattr(event.message.media.document, 'attributes', [])}"
-                print(f"Информация о видео: {video_info}")
-                
-                if self.waiting_for_slot:
-                    print("Сигнализируем об освобождении слота")
-                    self.slot_freed.set()
-                
-                # Проверяем, к какому запросу относится видео
-                matched_slot = None
-                best_similarity = 0
-                
-                for slot, request in list(self.active_requests.items()):
-                    # Пытаемся сопоставить видео с запросом
-                    similarity = self.prompt_matcher.calculate_similarity(request['prompt'], message_text)
-                    
-                    if similarity > 0.4 and similarity > best_similarity:  # Порог сходства для видео
-                        matched_slot = slot
-                        best_similarity = similarity
-                
-                # Если нашли соответствующий слот
-                if matched_slot:
-                    slot = matched_slot
-                    request = self.active_requests[slot]
-                    print(f"Видео соответствует запросу в слоте {slot} (сходство: {best_similarity:.2f})")
-                    
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_IDLE,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Получено видео для промпта {request["prompt_id"]}'
-                        })
-                    
-                    success = await self.video_downloader.download_video(
-                        event.message, 
-                        request['prompt_id'],
-                        request['model']
-                    )
-                    if success:
-                        print(f"Видео успешно загружено для промпта {request['prompt_id']}")
-                        request['event'].set()
-                        # Печатаем статусы всех слотов
-                        self.print_slot_statuses()
-                        return
-                
-                # Если не смогли определить слот, но есть только один запрос
-                elif len(self.active_requests) == 1:
-                    slot, request = next(iter(self.active_requests.items()))
-                    print(f"Предполагаем, что видео соответствует единственному активному запросу в слоте {slot}")
-                    
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_IDLE,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Получено видео для промпта {request["prompt_id"]}'
-                        })
-                    
-                    success = await self.video_downloader.download_video(
-                        event.message, 
-                        request['prompt_id'],
-                        request['model']
-                    )
-                    if success:
-                        print(f"Видео успешно загружено для промпта {request['prompt_id']}")
-                        request['event'].set()
-                        # Печатаем статусы всех слотов
-                        self.print_slot_statuses()
-                        return
-                
-                # Если не смогли определить, для какого запроса это видео
-                print("Не удалось определить, к какому запросу относится видео")
-                # Пытаемся загрузить видео с общим идентификатором
-                success = await self.video_downloader.download_video(
-                    event.message, 
-                    f"unknown_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                    "unknown"
-                )
-                if success:
-                    print("Видео загружено с общим идентификатором")
-                
-                # Печатаем статусы всех слотов
-                self.print_slot_statuses()
-                return
-
-            # Проверяем сообщения об ошибках
-            if any(msg in message_text for msg in self.error_messages):
-                print("Обнаружено сообщение об ошибке")
-                error_slot = None
-                
-                # Пытаемся определить, к какому запросу относится ошибка
-                for slot, request in list(self.active_requests.items()):
-                    # Используем эвристику для сопоставления
-                    similarity = self.prompt_matcher.calculate_similarity(request['prompt'], message_text)
-                    
-                    if similarity > 0.3:  # Низкий порог для ошибок
-                        error_slot = slot
-                        break
-                
-                # Если определили слот
-                if error_slot:
-                    slot = error_slot
-                    request = self.active_requests[slot]
-                    print(f"Получена ошибка от бота для слота {slot}")
-                    
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_ERROR,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Ошибка: {message_text[:50]}...'
-                        })
-                    
-                    # Обновляем историю изменений
-                    request['status_changes'].append({
-                        'time': datetime.now(), 
-                        'status': self.STATUS_ERROR
-                    })
-                    
-                    self.table_manager.mark_error(request['prompt_id'], request['model'], message_text)
-                    request['event'].set()
-                    
-                    # Если ожидаем освобождения слота
-                    if self.waiting_for_slot:
-                        self.slot_freed.set()
-                        
-                # Если не смогли определить, но есть только один активный запрос
-                elif len(self.active_requests) == 1:
-                    slot, request = next(iter(self.active_requests.items()))
-                    print(f"Предполагаем, что ошибка относится к единственному активному запросу в слоте {slot}")
-                    
-                    # Обновляем статус слота
-                    if slot in self.slot_status:
-                        self.slot_status[slot].update({
-                            'status': self.STATUS_ERROR,
-                            'last_update_time': datetime.now(),
-                            'last_status_message': f'Ошибка: {message_text[:50]}...'
-                        })
-                    
-                    # Обновляем историю изменений
-                    request['status_changes'].append({
-                        'time': datetime.now(), 
-                        'status': self.STATUS_ERROR
-                    })
-                    
-                    self.table_manager.mark_error(request['prompt_id'], request['model'], message_text)
-                    request['event'].set()
-                    
-                    # Если ожидаем освобождения слота
-                    if self.waiting_for_slot:
-                        self.slot_freed.set()
-                
-                # Печатаем статусы всех слотов
-                self.print_slot_statuses()
-                return
-
-            # Печатаем статусы всех слотов после каждого сообщения
-            self.print_slot_statuses()
-
-        # Запускаем обработчик сообщений
-        print("Мониторинг сообщений запущен")
-
-    def clear_history(self):
-        """Очистка истории промптов при новом запуске"""
-        self.prompt_history = []
-        self.reset_current_task()
-
-    def get_expected_filename(self, prompt, model):
-        """Генерирует шаблон имени файла для текущего запроса"""
-        # Получаем первые 5 слов из промпта
-        words = prompt.split()[:5]
-        prompt_start = '_'.join(words)
-        # Очищаем от спецсимволов
-        prompt_start = ''.join(c if c.isalnum() or c in ['_', '-'] else '_' for c in prompt_start)
+    def get_table_manager(self):
+        """
+        Безопасно получает доступ к table_manager
         
-        # Возвращаем только часть с промптом для сравнения
-        return prompt_start
-
-    def check_video_matches_prompt(self, filename, expected_prompt):
-        """Проверяет соответствие видео ожидаемому промпту"""
-        return self.prompt_matcher.is_matching(filename, expected_prompt)
-
-    def reset_current_task(self):
-        self.waiting_for_response = False
-        self.last_sent_prompt = None
-        self.current_prompt = None
-        self.expected_prompt = None
-        self.received_video_prompt = None
-        self.generation_in_progress = False
-        self.error_received = False
-        self.expected_filename = None 
-
-    def find_slot_by_last_prompt(self, message_text):
-        """Находит слот по промпту в сообщении об ошибке"""
-        for slot, request in self.active_requests.items():
-            if request['prompt'] in message_text:
-                return slot
-        return None 
-
-    async def wait_for_any_video(self):
-        """Ожидает получение любого видео для очистки слотов"""
-        video_received = asyncio.Event()
-        
-        @self.client.on(events.NewMessage(from_users=self.bot))
-        async def temp_handler(event):
-            if event.message.media and hasattr(event.message.media, 'document'):
-                if event.message.media.document.mime_type.startswith('video/'):
-                    video_received.set()
-                    # Удаляем временный обработчик
-                    self.client.remove_event_handler(temp_handler)
-
-        try:
-            await asyncio.wait_for(video_received.wait(), timeout=self.wait_time)
-            return True
-        except asyncio.TimeoutError:
-            print("Таймаут ожидания видео при очистке слотов")
-            return False
-
-    async def cleanup_active_slots(self):
-        """Очищает занятые слоты при старте программы"""
-        if self.startup_cleanup:
-            return True
-            
-        active_prompts = self.table_manager.get_active_prompts()
-        if not active_prompts:
-            self.startup_cleanup = True
-            return True
-
-        print("\nОбнаружены активные слоты с прошлого запуска")
-        print("Ожидаем получение видео для очистки слотов...")
-        
-        success = await self.wait_for_any_video()
-        if success:
-            # Очищаем все активные промпты
-            for prompt in active_prompts:
-                self.table_manager.mark_pending(prompt['id'])
-            print("Слоты очищены")
-        else:
-            print("Не удалось дождаться видео, очищаем слоты принудительно")
-            for prompt in active_prompts:
-                self.table_manager.mark_timeout(prompt['id'])
-
-        self.startup_cleanup = True
-        return True 
-
-    async def wait_for_generation_start(self, slot, timeout=30):
-        """Ожидает сообщение о начале генерации видео"""
-        if slot not in self.active_requests or slot not in self.generation_start_events:
-            return False
-        
-        # Обновляем статус
-        if slot in self.slot_status:
-            self.slot_status[slot].update({
-                'status': self.STATUS_WAITING_CONFIRMATION,
-                'last_update_time': datetime.now(),
-                'last_status_message': f'Ожидание подтверждения начала генерации'
-            })
-        
-        # Обновляем историю изменений
-        request = self.active_requests[slot]
-        request['status_changes'].append({
-            'time': datetime.now(), 
-            'status': self.STATUS_WAITING_CONFIRMATION
-        })
-        
-        # Проверяем, не было ли уже получено подтверждение
-        if request.get('generation_started', False):
-            print(f"Генерация уже была подтверждена ранее для слота {slot}")
-            return True
-        
-        try:
-            # Сбрасываем событие перед ожиданием
-            self.generation_start_events[slot].clear()
-            
-            # Ждем сообщение о начале генерации
-            print(f"Ожидаем подтверждения генерации в течение {timeout} секунд...")
-            await asyncio.wait_for(self.generation_start_events[slot].wait(), timeout=timeout)
-            
-            # Если дождались, обновляем статус
-            if slot in self.active_requests:
-                request = self.active_requests[slot]
-                self.table_manager.mark_generation_started(request['prompt_id'], request['model'])
-                request['generation_started'] = True
-                
-                # Обновляем историю изменений
-                request['status_changes'].append({
-                    'time': datetime.now(), 
-                    'status': self.STATUS_GENERATING
-                })
-                
-                # Обновляем статус слота
-                if slot in self.slot_status:
-                    self.slot_status[slot].update({
-                        'status': self.STATUS_GENERATING,
-                        'last_update_time': datetime.now(),
-                        'last_status_message': f'Генерация видео для промпта {request["prompt_id"]}'
-                    })
-                
-                return True
-        except asyncio.TimeoutError:
-            # Проверяем наличие лимита
-            if slot in self.active_requests and self.active_requests[slot].get('limit_detected', False):
-                # Обновляем статус слота
-                if slot in self.slot_status:
-                    self.slot_status[slot].update({
-                        'status': self.STATUS_LIMIT_REACHED,
-                        'last_update_time': datetime.now(),
-                        'last_status_message': f'Достигнут лимит запросов'
-                    })
-                return False
-                
-            print(f"Таймаут ожидания начала генерации в слоте {slot}")
-            
-            # Проверяем, не появилось ли видео, несмотря на отсутствие подтверждения
-            # Это может произойти, если сообщение о начале генерации было пропущено
-            if slot in self.active_requests:
-                # Обновляем статус слота на "ожидание видео" вместо ошибки
-                if slot in self.slot_status:
-                    self.slot_status[slot].update({
-                        'status': self.STATUS_WAITING_VIDEO,
-                        'last_update_time': datetime.now(),
-                        'last_status_message': f'Ожидание видео без подтверждения генерации'
-                    })
-                
-                # Обновляем историю изменений
-                request = self.active_requests[slot]
-                request['status_changes'].append({
-                    'time': datetime.now(), 
-                    'status': self.STATUS_WAITING_VIDEO
-                })
-                
-                print(f"Переходим к ожиданию видео без подтверждения генерации для слота {slot}")
-                return False
-            
-            # Обновляем статус слота
-            if slot in self.slot_status:
-                self.slot_status[slot].update({
-                    'status': self.STATUS_ERROR,
-                    'last_update_time': datetime.now(),
-                    'last_status_message': f'Таймаут ожидания подтверждения'
-                })
-            
-            return False
-    
-    def check_limit_detected(self, slot):
-        """Проверяет, был ли обнаружен лимит запросов для слота"""
-        return slot in self.active_requests and self.active_requests[slot].get('limit_detected', False)
-        
-    def get_slot_status(self, slot):
-        """Возвращает текущий статус слота"""
-        if slot in self.slot_status:
-            return self.slot_status[slot]
+        Returns:
+            TableManager или None, если недоступен
+        """
+        if hasattr(self, 'table_manager') and self.table_manager:
+            return self.table_manager
+        elif hasattr(self.video_downloader, 'table_manager'):
+            return self.video_downloader.table_manager
         return None
-
-    def print_slot_statuses(self):
-        """Выводит статусы всех слотов"""
-        print("\nСтатусы слотов:")
-        for slot, status in self.slot_status.items():
-            status_message = f"Слот {slot}: {status['status']} - {status['last_status_message']} " \
-                            f"(обновлен {status['last_update_time'].strftime('%H:%M:%S')})"
-            print(status_message)
-            # Логируем статус слота
-            self.message_logger.log_slot_status(slot, status['status'], status['last_status_message']) 
